@@ -2171,6 +2171,7 @@ impl Renderer {
         bg_color: Option<[f32; 4]>,
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
         text: &mut crate::text::Text,
+        pre_present: &mut dyn FnMut(),
     ) {
         use block::ConcreteBlock;
         use std::cell::Cell as StdCell;
@@ -2425,6 +2426,7 @@ impl Renderer {
             .copy();
             command_buffer.add_completed_handler(&block);
 
+            pre_present();
             command_buffer.present_drawable(&surface_texture.drawable);
             command_buffer.commit();
             return;

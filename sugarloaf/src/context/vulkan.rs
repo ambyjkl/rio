@@ -127,7 +127,7 @@ pub struct VulkanContext {
     frame_index: usize,
     frames: [FrameSync; FRAMES_IN_FLIGHT],
 
-    // Swapchain state. Rebuilt by `resize()`.
+    // Swapchain state. Resize requests are applied at the next acquisition.
     swapchain_extent: vk::Extent2D,
     swapchain_color_space: vk::ColorSpaceKHR,
     swapchain_format: vk::Format,
@@ -318,19 +318,22 @@ impl VulkanContext {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
+        if width == 0
+            || height == 0
+            || (self.size.width == width as f32 && self.size.height == height as f32)
+        {
             return;
         }
         self.size.width = width as f32;
         self.size.height = height as f32;
-        self.recreate_swapchain(width, height);
+        // Do not drain the GPU or allocate a swapchain while dispatching
+        // resize events. Draw once using the latest requested dimensions.
+        self.needs_recreate = true;
     }
 
     fn recreate_swapchain(&mut self, width: u32, height: u32) {
-        // The spec requires no resources tied to the old swapchain be
-        // in use. Easiest safe path: wait for the device to go idle.
-        // This is a resize, not a per-frame operation, so the stall is
-        // acceptable (wgpu does the same thing).
+        // Retain the synchronization needed to destroy the old resources.
+        // Recreation happens at acquisition, not for every resize event.
         unsafe {
             let _ = self.shared.device_wait_idle();
         }
@@ -1429,12 +1432,6 @@ fn create_swapchain(
         .copied()
         .unwrap_or(formats[0]);
 
-    // FIFO. Spec-guaranteed and vsync-throttled at present time, so the
-    // renderer can't outrun the display. MAILBOX on X11 (Mesa DRI3/Present)
-    // runs a driver-side polling thread and discards rendered frames, which
-    // pegged Xorg under sustained input.
-    let present_mode = vk::PresentModeKHR::FIFO;
-
     let extent = if caps.current_extent.width != u32::MAX {
         caps.current_extent
     } else {
@@ -1469,7 +1466,7 @@ fn create_swapchain(
         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
         .pre_transform(caps.current_transform)
         .composite_alpha(composite_alpha)
-        .present_mode(present_mode)
+        .present_mode(vk::PresentModeKHR::FIFO)
         .clipped(true)
         .old_swapchain(old);
 
