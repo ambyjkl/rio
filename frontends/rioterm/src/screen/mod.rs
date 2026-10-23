@@ -1281,6 +1281,12 @@ impl Screen<'_> {
                     Act::SplitDown => {
                         self.split_down();
                     }
+                    Act::SplitAuto => {
+                        self.split_auto();
+                    }
+                    Act::SplitEqualize => {
+                        self.split_equalize();
+                    }
                     Act::MoveDividerUp => {
                         // User wants divider to move up visually, which means expanding the bottom split
                         self.move_divider_down();
@@ -1496,6 +1502,21 @@ impl Screen<'_> {
                         self.context_manager.select_prev_split();
                         self.mark_dirty();
                     }
+                    Act::SelectLeftSplit
+                    | Act::SelectRightSplit
+                    | Act::SelectUpSplit
+                    | Act::SelectDownSplit => {
+                        self.cancel_search(clipboard);
+                        let (dx, dy) = match action {
+                            Act::SelectLeftSplit => (-1.0, 0.0),
+                            Act::SelectRightSplit => (1.0, 0.0),
+                            Act::SelectUpSplit => (0.0, -1.0),
+                            Act::SelectDownSplit => (0.0, 1.0),
+                            _ => unreachable!(),
+                        };
+                        self.context_manager.select_split_direction(dx, dy);
+                        self.mark_dirty();
+                    }
                     Act::SelectNextSplitOrTab => {
                         self.cancel_search(clipboard);
                         self.clear_selection();
@@ -1651,6 +1672,21 @@ impl Screen<'_> {
 
         self.refresh_titles();
         self.mark_dirty();
+    }
+
+    pub fn split_auto(&mut self) {
+        if self.context_manager.current_grid().auto_split_down() {
+            self.split_down();
+        } else {
+            self.split_right();
+        }
+    }
+
+    pub fn split_equalize(&mut self) {
+        if self.context_manager.split_equalize(&mut self.sugarloaf) {
+            self.mark_dirty();
+            self.renderer.trail_cursor.snap();
+        }
     }
 
     pub fn move_divider_up(&mut self) {
@@ -3806,11 +3842,26 @@ impl Screen<'_> {
             }
             PaletteAction::SplitRight => self.split_right(),
             PaletteAction::SplitDown => self.split_down(),
+            PaletteAction::SplitAuto => self.split_auto(),
+            PaletteAction::SplitEqualize => self.split_equalize(),
             PaletteAction::SelectNextSplit => {
                 self.context_manager.select_next_split();
             }
             PaletteAction::SelectPrevSplit => {
                 self.context_manager.select_prev_split();
+            }
+            PaletteAction::SelectLeftSplit
+            | PaletteAction::SelectRightSplit
+            | PaletteAction::SelectUpSplit
+            | PaletteAction::SelectDownSplit => {
+                let (dx, dy) = match action {
+                    PaletteAction::SelectLeftSplit => (-1.0, 0.0),
+                    PaletteAction::SelectRightSplit => (1.0, 0.0),
+                    PaletteAction::SelectUpSplit => (0.0, -1.0),
+                    PaletteAction::SelectDownSplit => (0.0, 1.0),
+                    _ => unreachable!(),
+                };
+                self.context_manager.select_split_direction(dx, dy);
             }
             PaletteAction::CloseCurrentSplitOrTab => self.close_split_or_tab(clipboard),
             PaletteAction::ConfigEditor => {

@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod compute_tests;
+#[cfg(test)]
+mod split_tests;
 
 use crate::context::Context;
 use crate::mouse::Mouse;
@@ -592,6 +594,15 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
     }
 
+    /// Split along the focused panel's longer physical axis, like Ghostty.
+    /// Square panels split down.
+    pub fn auto_split_down(&self) -> bool {
+        self.tree
+            .layout(self.current)
+            .map(|layout| layout.size.height >= layout.size.width)
+            .unwrap_or(false)
+    }
+
     fn try_split_right(&mut self) -> Result<NodeId, TaffyError> {
         self.split_panel(taffy::FlexDirection::Row)
     }
@@ -971,6 +982,94 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         });
 
         panels.into_iter().map(|(id, _, _)| id).collect()
+    }
+
+    /// Select the nearest split in the requested direction, if one exists.
+    pub fn select_split_direction(&mut self, dx: f32, dy: f32) {
+        let Some(current) = self.inner.get(&self.current) else {
+            return;
+        };
+        let [x, y, width, height] = current.layout_rect;
+        let center = (x + width / 2.0, y + height / 2.0);
+
+        let candidate = self
+            .inner
+            .iter()
+            .filter(|(id, _)| **id != self.current)
+            .filter_map(|(&id, item)| {
+                let [other_x, other_y, other_width, other_height] = item.layout_rect;
+                let other_center =
+                    (other_x + other_width / 2.0, other_y + other_height / 2.0);
+                let primary =
+                    (other_center.0 - center.0) * dx + (other_center.1 - center.1) * dy;
+                if primary <= 0.0 {
+                    return None;
+                }
+
+                // Favor panes sharing an edge/row/column over a nearer pane
+                // that is only diagonally positioned. Within each group,
+                // choose the smallest edge-to-edge distance, then the closest
+                // perpendicular alignment.
+                let (primary_gap, perpendicular_gap, perpendicular_center, visual_order) =
+                    if dx != 0.0 {
+                        let gap = if dx > 0.0 {
+                            other_x - (x + width)
+                        } else {
+                            x - (other_x + other_width)
+                        };
+                        let cross_gap = if other_y + other_height < y {
+                            y - (other_y + other_height)
+                        } else if y + height < other_y {
+                            other_y - (y + height)
+                        } else {
+                            0.0
+                        };
+                        (
+                            gap.max(0.0),
+                            cross_gap,
+                            (other_center.1 - center.1).abs(),
+                            other_y,
+                        )
+                    } else {
+                        let gap = if dy > 0.0 {
+                            other_y - (y + height)
+                        } else {
+                            y - (other_y + other_height)
+                        };
+                        let cross_gap = if other_x + other_width < x {
+                            x - (other_x + other_width)
+                        } else if x + width < other_x {
+                            other_x - (x + width)
+                        } else {
+                            0.0
+                        };
+                        (
+                            gap.max(0.0),
+                            cross_gap,
+                            (other_center.0 - center.0).abs(),
+                            other_x,
+                        )
+                    };
+                Some((
+                    id,
+                    perpendicular_gap > 0.0,
+                    primary_gap,
+                    perpendicular_gap,
+                    perpendicular_center,
+                    visual_order,
+                ))
+            })
+            .min_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                    .then(a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal))
+                    .then(a.4.partial_cmp(&b.4).unwrap_or(std::cmp::Ordering::Equal))
+                    .then(a.5.partial_cmp(&b.5).unwrap_or(std::cmp::Ordering::Equal))
+            });
+
+        if let Some((id, _, _, _, _, _)) = candidate {
+            self.current = id;
+        }
     }
 
     #[inline]
@@ -1434,6 +1533,48 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             self.apply_taffy_layout(sugarloaf);
             self.current = new_node;
         }
+    }
+
+    /// Equalize every split in this tab using Ghostty's axis-aware weights.
+    pub fn split_equalize(&mut self, sugarloaf: &mut Sugarloaf) -> bool {
+        if self.panel_count() <= 1 {
+            return false;
+        }
+
+        if self.equalize_node(self.root_node).is_err() {
+            return false;
+        }
+        self.apply_taffy_layout(sugarloaf)
+    }
+
+    /// Return this subtree's weights along [horizontal, vertical] axes.
+    /// Same-axis splits add their children's weights; perpendicular subtrees
+    /// count as one unit, even if they contain further same-axis splits.
+    fn equalize_node(&mut self, node: NodeId) -> Result<[usize; 2], TaffyError> {
+        let children = self.tree.children(node)?;
+        if children.is_empty() {
+            return Ok([1, 1]);
+        }
+
+        let axis = usize::from(matches!(
+            self.tree.style(node)?.flex_direction,
+            taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse
+        ));
+        let mut weights = [1, 1];
+        weights[axis] = 0;
+        for child in children {
+            let child_weight = self.equalize_node(child)?[axis];
+            weights[axis] += child_weight;
+
+            // Only change child flex weights, preserving window dimensions,
+            // padding, margins, gaps, and split orientations.
+            let mut style = self.tree.style(child)?.clone();
+            style.flex_basis = length(0.0);
+            style.flex_grow = child_weight as f32;
+            style.flex_shrink = 1.0;
+            self.tree.set_style(child, style)?;
+        }
+        Ok(weights)
     }
 
     pub fn move_divider_up(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
