@@ -142,6 +142,8 @@ pub struct Navigation {
     pub color_automation: Vec<ColorAutomation>,
     #[serde(default = "bool::default", skip_serializing)]
     pub clickable: bool,
+    /// New tabs and splits inherit the root shell process's current directory,
+    /// not a foreground job's directory, regardless of the PTY spawn method.
     #[serde(
         default = "default_bool_true",
         rename = "current-working-directory",
