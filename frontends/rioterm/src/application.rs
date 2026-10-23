@@ -1986,6 +1986,18 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.window.winit_window.set_cursor_visible(true);
                 }
 
+                // Wheel input follows the pointer, independently of keyboard
+                // focus. Ignore window chrome and gaps between split panes.
+                let screen = &route.window.screen;
+                let Some(scroll_target) =
+                    screen.ctx().current_grid().find_context_at_position(
+                        screen.mouse.x as f32,
+                        screen.mouse.y as f32,
+                    )
+                else {
+                    return;
+                };
+
                 match delta {
                     MouseScrollDelta::LineDelta(columns, lines) => {
                         // One wheel notch is one line/column. Convert
@@ -1993,15 +2005,19 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         // accumulated pixels by it, and converting
                         // with font_size (smaller than a cell) made
                         // single notches floor to zero lines (#1350).
-                        let cell =
-                            route.window.screen.ctx().current().dimension.dimension;
+                        let cell = route.window.screen.ctx().current_grid().contexts()
+                            [&scroll_target]
+                            .context()
+                            .dimension
+                            .dimension;
                         if cell.width > 0.0 && cell.height > 0.0 {
                             let new_scroll_px_x = columns * cell.width;
                             let new_scroll_px_y = lines * cell.height;
-                            route
-                                .window
-                                .screen
-                                .scroll(new_scroll_px_x as f64, new_scroll_px_y as f64);
+                            route.window.screen.scroll_in_context(
+                                scroll_target,
+                                new_scroll_px_x as f64,
+                                new_scroll_px_y as f64,
+                            );
                         }
                     }
                     MouseScrollDelta::PixelDelta(mut lpos) => {
@@ -2020,7 +2036,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                     lpos.x = 0.;
                                 }
 
-                                route.window.screen.scroll(lpos.x, lpos.y);
+                                route.window.screen.scroll_in_context(
+                                    scroll_target,
+                                    lpos.x,
+                                    lpos.y,
+                                );
                             }
                             _ => (),
                         }
