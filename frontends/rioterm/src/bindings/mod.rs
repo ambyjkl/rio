@@ -1154,6 +1154,7 @@ pub fn platform_key_bindings(
         "c", ModifiersState::CONTROL, +BindingMode::SEARCH; SearchAction::SearchCancel;
         "u", ModifiersState::CONTROL, +BindingMode::SEARCH; SearchAction::SearchClear;
         "w", ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchDeleteWord;
+        Key::Named(Backspace), ModifiersState::CONTROL, +BindingMode::SEARCH; SearchAction::SearchDeleteWord;
         "p", ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
         "n", ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
         Key::Named(ArrowUp), +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
@@ -1236,6 +1237,7 @@ pub fn platform_key_bindings(
         "c", ModifiersState::CONTROL, +BindingMode::SEARCH; SearchAction::SearchCancel;
         "u", ModifiersState::CONTROL, +BindingMode::SEARCH; SearchAction::SearchClear;
         "w", ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchDeleteWord;
+        Key::Named(Backspace), ModifiersState::CONTROL, +BindingMode::SEARCH; SearchAction::SearchDeleteWord;
         "p", ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
         "n", ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
         Key::Named(ArrowUp), +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
@@ -1304,6 +1306,7 @@ pub fn platform_key_bindings(
         "c", ModifiersState::CONTROL, +BindingMode::SEARCH; SearchAction::SearchCancel;
         "u", ModifiersState::CONTROL, +BindingMode::SEARCH; SearchAction::SearchClear;
         "w", ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchDeleteWord;
+        Key::Named(Backspace), ModifiersState::CONTROL, +BindingMode::SEARCH; SearchAction::SearchDeleteWord;
         "p", ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
         "n", ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
         Key::Named(ArrowUp), +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
