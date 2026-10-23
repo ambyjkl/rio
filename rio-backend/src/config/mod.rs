@@ -138,7 +138,7 @@ pub struct Config {
     pub fonts: SugarloafFonts,
     #[serde(default = "default_editor")]
     pub editor: Shell,
-    #[serde(default = "default_margin", alias = "margin")]
+    #[serde(default = "default_margin", alias = "padding")]
     pub margin: Margin,
     #[serde(default = "Panel::default")]
     pub panel: Panel,
@@ -969,6 +969,26 @@ mod tests {
         assert_eq!(result.bindings.keys[0].with, "super");
         assert_eq!(result.bindings.keys[0].action.to_owned(), "Quit");
         assert!(result.bindings.keys[0].esc.to_owned().is_empty());
+    }
+
+    #[test]
+    fn padding_and_margin_keys_accept_css_spacing() {
+        for key in ["padding", "margin"] {
+            for (values, expected) in [
+                ("[0]", Margin::all(0.0)),
+                ("[3]", Margin::all(3.0)),
+                ("[3, 7]", Margin::new(3.0, 7.0, 3.0, 7.0)),
+                ("[1, 2, 3, 4]", Margin::new(1.0, 2.0, 3.0, 4.0)),
+            ] {
+                let config: Config =
+                    toml::from_str(&format!("{key} = {values}")).unwrap();
+                assert_eq!(config.margin, expected, "{key} = {values}");
+                assert_eq!(config.panel, Panel::default());
+            }
+        }
+
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.margin, default_margin());
     }
 
     #[test]
