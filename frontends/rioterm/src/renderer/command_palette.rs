@@ -76,8 +76,14 @@ pub enum PaletteAction {
     SelectPrevTab,
     SplitRight,
     SplitDown,
+    SplitAuto,
+    SplitEqualize,
     SelectNextSplit,
     SelectPrevSplit,
+    SelectLeftSplit,
+    SelectRightSplit,
+    SelectUpSplit,
+    SelectDownSplit,
     ConfigEditor,
     WindowCreateNew,
     IncreaseFontSize,
@@ -143,6 +149,16 @@ const COMMANDS: &[Command] = &[
         action: PaletteAction::SplitDown,
     },
     Command {
+        title: "Split Auto",
+        shortcut: "",
+        action: PaletteAction::SplitAuto,
+    },
+    Command {
+        title: "Equalize Splits",
+        shortcut: "",
+        action: PaletteAction::SplitEqualize,
+    },
+    Command {
         title: "Next Split",
         shortcut: "",
         action: PaletteAction::SelectNextSplit,
@@ -151,6 +167,26 @@ const COMMANDS: &[Command] = &[
         title: "Previous Split",
         shortcut: "",
         action: PaletteAction::SelectPrevSplit,
+    },
+    Command {
+        title: "Select Left Split",
+        shortcut: "",
+        action: PaletteAction::SelectLeftSplit,
+    },
+    Command {
+        title: "Select Right Split",
+        shortcut: "",
+        action: PaletteAction::SelectRightSplit,
+    },
+    Command {
+        title: "Select Up Split",
+        shortcut: "",
+        action: PaletteAction::SelectUpSplit,
+    },
+    Command {
+        title: "Select Down Split",
+        shortcut: "",
+        action: PaletteAction::SelectDownSplit,
     },
     Command {
         title: "Close Split or Tab",
@@ -959,8 +995,27 @@ mod tests {
         let mut palette = CommandPalette::new();
         palette.query = "QUIT".to_string();
         let filtered = palette.filtered_rows();
-        assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].1.title(), "Quit");
+        let uppercase: Vec<_> = filtered.iter().map(|(index, _)| *index).collect();
+        palette.query = "quit".to_string();
+        let lowercase: Vec<_> = palette
+            .filtered_rows()
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+        assert_eq!(uppercase, lowercase);
+    }
+
+    #[test]
+    fn split_commands_are_actionable() {
+        for (query, expected) in [
+            ("Split Auto", PaletteAction::SplitAuto),
+            ("Equalize Splits", PaletteAction::SplitEqualize),
+        ] {
+            let mut palette = CommandPalette::new();
+            palette.set_query(query.to_string());
+            assert_eq!(palette.get_selected_action(), Some(expected));
+        }
     }
 
     #[test]

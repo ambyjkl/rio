@@ -258,8 +258,14 @@ impl From<String> for Action {
             "scrolltobottom" => Some(Action::ScrollToBottom),
             "splitright" => Some(Action::SplitRight),
             "splitdown" => Some(Action::SplitDown),
+            "splitauto" => Some(Action::SplitAuto),
+            "splitequalize" => Some(Action::SplitEqualize),
             "selectnextsplit" => Some(Action::SelectNextSplit),
             "selectprevsplit" => Some(Action::SelectPrevSplit),
+            "selectleftsplit" => Some(Action::SelectLeftSplit),
+            "selectrightsplit" => Some(Action::SelectRightSplit),
+            "selectupsplit" => Some(Action::SelectUpSplit),
+            "selectdownsplit" => Some(Action::SelectDownSplit),
             "selectnextsplitortab" => Some(Action::SelectNextSplitOrTab),
             "selectprevsplitortab" => Some(Action::SelectPrevSplitOrTab),
             "movedividerup" => Some(Action::MoveDividerUp),
@@ -496,11 +502,24 @@ pub enum Action {
     /// Split vertically
     SplitDown,
 
+    /// Split the active pane along its longer pixel axis: right if width > height,
+    /// otherwise down.
+    SplitAuto,
+
+    /// Equalize splits in the active tab, counting perpendicular subtrees as one unit.
+    SplitEqualize,
+
     /// Select next split
     SelectNextSplit,
 
     /// Select previous split
     SelectPrevSplit,
+
+    /// Select the split to the left/right/up/down.
+    SelectLeftSplit,
+    SelectRightSplit,
+    SelectUpSplit,
+    SelectDownSplit,
 
     /// Select next split if available if not next tab
     SelectNextSplitOrTab,
@@ -1688,6 +1707,31 @@ mod tests {
         let new_bindings = config_key_bindings(config_bindings, bindings);
         assert_eq!(new_bindings.len(), 1);
         assert_eq!(new_bindings[0].action, Action::Quit);
+    }
+
+    #[test]
+    fn split_actions_parse_case_insensitively_in_config() {
+        for (name, expected) in [
+            ("SplitAuto", Action::SplitAuto),
+            ("splitauto", Action::SplitAuto),
+            ("SPLITAUTO", Action::SplitAuto),
+            ("sPlItAuTo", Action::SplitAuto),
+            ("SplitEqualize", Action::SplitEqualize),
+            ("splitequalize", Action::SplitEqualize),
+            ("SPLITEQUALIZE", Action::SplitEqualize),
+            ("sPlItEqUaLiZe", Action::SplitEqualize),
+        ] {
+            let config_bindings = vec![ConfigKeyBinding {
+                key: String::from("e"),
+                action: String::from(name),
+                with: String::from(""),
+                esc: String::from(""),
+                mode: String::from(""),
+            }];
+            let new_bindings = config_key_bindings(config_bindings, Vec::new());
+            assert_eq!(new_bindings.len(), 1, "{name} must parse");
+            assert_eq!(new_bindings[0].action, expected, "{name}");
+        }
     }
 
     #[test]
