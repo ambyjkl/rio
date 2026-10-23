@@ -921,6 +921,18 @@ impl Sugarloaf<'_> {
         &mut self,
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
     ) {
+        self.render_with_grids_and_pre_present(grids, || {});
+    }
+
+    /// Render with a notification immediately before the actual presentation.
+    /// Window-system frame callbacks belong here, after successful acquisition
+    /// and drawing, not at redraw entry: skipped/dropped frames must not arm a
+    /// callback that has no surface commit to deliver it.
+    pub fn render_with_grids_and_pre_present(
+        &mut self,
+        grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
+        mut pre_present: impl FnMut(),
+    ) {
         self.state.compute_dimensions();
         self.state.compute_updates(
             &mut self.renderer,
@@ -933,18 +945,18 @@ impl Sugarloaf<'_> {
         match self.ctx.inner {
             #[cfg(feature = "wgpu")]
             crate::context::ContextType::Wgpu(_) => {
-                self.render_wgpu(grids);
+                self.render_wgpu_with_pre_present(grids, &mut pre_present);
             }
             #[cfg(target_os = "macos")]
             crate::context::ContextType::Metal(_) => {
-                self.render_metal(grids);
+                self.render_metal_with_pre_present(grids, &mut pre_present);
             }
             #[cfg(target_os = "linux")]
             crate::context::ContextType::Vulkan(_) => {
-                self.render_vulkan(grids);
+                self.render_vulkan_with_pre_present(grids, &mut pre_present);
             }
             crate::context::ContextType::Cpu(_) => {
-                self.render_cpu(grids);
+                self.render_cpu_with_pre_present(grids, &mut pre_present);
             }
             #[cfg(not(feature = "wgpu"))]
             crate::context::ContextType::_Phantom(_) => unreachable!(),
@@ -955,6 +967,14 @@ impl Sugarloaf<'_> {
     pub fn render_cpu(
         &mut self,
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
+    ) {
+        self.render_cpu_with_pre_present(grids, &mut || {});
+    }
+
+    fn render_cpu_with_pre_present(
+        &mut self,
+        grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
+        pre_present: &mut dyn FnMut(),
     ) {
         let bg = self.background_color;
         let cpu_ctx = match &mut self.ctx.inner {
@@ -973,6 +993,7 @@ impl Sugarloaf<'_> {
                 overlays: &self.image_overlays,
                 data: &self.image_data,
             },
+            pre_present,
         );
 
         self.reset();
@@ -988,6 +1009,15 @@ impl Sugarloaf<'_> {
         &mut self,
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
     ) {
+        self.render_metal_with_pre_present(grids, &mut || {});
+    }
+
+    #[cfg(target_os = "macos")]
+    fn render_metal_with_pre_present(
+        &mut self,
+        grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
+        pre_present: &mut dyn FnMut(),
+    ) {
         let ctx = match &mut self.ctx.inner {
             crate::context::ContextType::Metal(metal) => metal,
             _ => return,
@@ -997,7 +1027,7 @@ impl Sugarloaf<'_> {
             .background_color
             .map(|c| [c.r as f32, c.g as f32, c.b as f32, c.a as f32]);
         self.renderer
-            .render_metal(ctx, bg_color, grids, &mut self.text);
+            .render_metal(ctx, bg_color, grids, &mut self.text, pre_present);
 
         self.reset();
     }
@@ -1022,6 +1052,15 @@ impl Sugarloaf<'_> {
         &mut self,
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
     ) {
+        self.render_vulkan_with_pre_present(grids, &mut || {});
+    }
+
+    #[cfg(target_os = "linux")]
+    fn render_vulkan_with_pre_present(
+        &mut self,
+        grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
+        pre_present: &mut dyn FnMut(),
+    ) {
         use crate::renderer::vulkan as vkr;
 
         let ctx = match &mut self.ctx.inner {
@@ -1032,8 +1071,9 @@ impl Sugarloaf<'_> {
         let frame = match ctx.acquire_frame() {
             Some(f) => f,
             None => {
-                // Swapchain was recreated this turn — skip drawing,
-                // try again next frame.
+                // The swapchain was out of date. Keep the final resize
+                // repaint pending rather than waiting for unrelated input.
+                self.renderer.frame_dropped = true;
                 self.reset();
                 return;
             }
@@ -1122,6 +1162,7 @@ impl Sugarloaf<'_> {
         }
         vkr::cmd_release_image_to_present(&device, cmd, frame.image);
 
+        pre_present();
         ctx.present_frame(frame);
 
         self.reset();
@@ -1133,6 +1174,15 @@ impl Sugarloaf<'_> {
         &mut self,
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
     ) {
+        self.render_wgpu_with_pre_present(grids, &mut || {});
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn render_wgpu_with_pre_present(
+        &mut self,
+        grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
+        pre_present: &mut dyn FnMut(),
+    ) {
         let ctx = match &mut self.ctx.inner {
             crate::context::ContextType::Wgpu(wgpu) => wgpu,
             _ => return,
@@ -1142,6 +1192,7 @@ impl Sugarloaf<'_> {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             _ => {
+                self.renderer.frame_dropped = true;
                 self.reset();
                 return;
             }
@@ -1253,6 +1304,7 @@ impl Sugarloaf<'_> {
             filters_brush.render(ctx, &mut encoder, &frame.texture, &frame.texture);
         }
         ctx.queue.submit(Some(encoder.finish()));
+        pre_present();
         ctx.queue.present(frame);
         self.reset();
     }
