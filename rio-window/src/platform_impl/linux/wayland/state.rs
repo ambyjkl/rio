@@ -9,7 +9,13 @@ use sctk::reexports::client::backend::ObjectId;
 use sctk::reexports::client::globals::GlobalList;
 use sctk::reexports::client::protocol::wl_output::WlOutput;
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
-use sctk::reexports::client::{Connection, Proxy, QueueHandle};
+use sctk::reexports::client::{Connection, Dispatch, Proxy, QueueHandle};
+use sctk::reexports::protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
+    self, ZwlrLayerSurfaceV1,
+};
+use sctk::shell::wlr_layer::{
+    LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure, SurfaceKind,
+};
 
 use sctk::compositor::{CompositorHandler, CompositorState};
 use sctk::output::{OutputHandler, OutputState};
@@ -64,6 +70,9 @@ pub struct WinitState {
 
     /// The XDG shell that is used for windows.
     pub xdg_shell: XdgShell,
+
+    /// Optional shell for quake overlays, independent of desktop workspaces.
+    pub layer_shell: Option<LayerShell>,
 
     /// The currently present windows.
     pub windows: RefCell<AHashMap<WindowId, Arc<Mutex<WindowState>>>>,
@@ -217,6 +226,7 @@ impl WinitState {
 
             xdg_shell: XdgShell::bind(globals, queue_handle)
                 .map_err(WaylandError::Bind)?,
+            layer_shell: LayerShell::bind(globals, queue_handle).ok(),
             xdg_activation: XdgActivationState::bind(globals, queue_handle).ok(),
 
             windows: Default::default(),
@@ -370,16 +380,137 @@ impl WindowHandler for WinitState {
     }
 }
 
+impl WinitState {
+    fn layer_configure(
+        &mut self,
+        surface: &WlSurface,
+        role: &ZwlrLayerSurfaceV1,
+        size: (u32, u32),
+        serial: Option<u32>,
+    ) {
+        let window_id = super::make_wid(surface);
+        let Some(window) = self.windows.get_mut().get(&window_id) else {
+            return;
+        };
+        let mut window = window.lock().unwrap();
+        if !window
+            .window
+            .layer()
+            .is_some_and(|layer| layer.is_current(role))
+        {
+            return; // Ignore events from a destroyed role after a rapid toggle.
+        }
+        if let Some(serial) = serial {
+            role.ack_configure(serial);
+        }
+        let resized = window.configure_layer(size);
+        if let Some(update) = self
+            .window_compositor_updates
+            .iter_mut()
+            .find(|u| u.window_id == window_id)
+        {
+            update.resized |= resized;
+        } else {
+            let mut update = WindowCompositorUpdate::new(window_id);
+            update.resized = resized;
+            self.window_compositor_updates.push(update);
+        }
+        if let Some(requests) = self.window_requests.get_mut().get(&window_id) {
+            requests.redraw_requested.store(true, Ordering::Relaxed);
+        }
+        self.dispatched_events = true;
+    }
+
+    fn layer_closed(&mut self, surface: &WlSurface, role: &ZwlrLayerSurfaceV1) {
+        let window_id = super::make_wid(surface);
+        let Some(window) = self.windows.get_mut().get(&window_id) else {
+            return;
+        };
+        let mut window = window.lock().unwrap();
+        let Some(layer) = window.window.layer() else {
+            return;
+        };
+        if !layer.is_current(role) {
+            return;
+        }
+        // `closed` also means the output disappeared, not that the user
+        // closed the terminal. Keep its session and desired visibility alive.
+        window.suspend_layer();
+        self.dispatched_events = true;
+    }
+}
+
+impl LayerShellHandler for WinitState {
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if let SurfaceKind::Wlr(role) = layer.kind() {
+            self.layer_closed(layer.wl_surface(), role);
+        }
+    }
+
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        layer: &LayerSurface,
+        configure: LayerSurfaceConfigure,
+        _: u32,
+    ) {
+        if let SurfaceKind::Wlr(role) = layer.kind() {
+            self.layer_configure(layer.wl_surface(), role, configure.new_size, None);
+        }
+    }
+}
+
+// Unlike SCTK's LayerSurfaceData, this role's data does not own the wl_surface.
+// The shell wrapper destroys only the role on hide, preserving render resources.
+impl Dispatch<ZwlrLayerSurfaceV1, WlSurface> for WinitState {
+    fn event(
+        state: &mut Self,
+        role: &ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        surface: &WlSurface,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                state.layer_configure(surface, role, (width, height), Some(serial));
+            }
+            zwlr_layer_surface_v1::Event::Closed => state.layer_closed(surface, role),
+            _ => (),
+        }
+    }
+}
+
+impl WinitState {
+    fn allow_layer_recovery(&mut self) {
+        // Output-only events must reach single_iteration even under Wait;
+        // otherwise recovery would depend on unrelated input or a timer.
+        self.dispatched_events = true;
+        for window in self.windows.get_mut().values() {
+            window.lock().unwrap().layer_recovery_attempted = false;
+        }
+    }
+}
+
 impl OutputHandler for WinitState {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
-        self.monitors
-            .lock()
-            .unwrap()
-            .push(MonitorHandle::new(output));
+    fn new_output(
+        &mut self,
+        connection: &Connection,
+        queue_handle: &QueueHandle<Self>,
+        output: WlOutput,
+    ) {
+        // Initial globals are already in `monitors` before their first done
+        // event. Appending here would retain duplicate, dead monitors on unplug.
+        self.update_output(connection, queue_handle, output);
     }
 
     fn update_output(
@@ -395,6 +526,8 @@ impl OutputHandler for WinitState {
         } else {
             monitors.push(updated)
         }
+        drop(monitors);
+        self.allow_layer_recovery();
     }
 
     fn output_destroyed(
@@ -404,10 +537,9 @@ impl OutputHandler for WinitState {
         removed: WlOutput,
     ) {
         let mut monitors = self.monitors.lock().unwrap();
-        let removed = MonitorHandle::new(removed);
-        if let Some(pos) = monitors.iter().position(|output| output == &removed) {
-            monitors.remove(pos);
-        }
+        monitors.retain(|monitor| monitor.proxy != removed);
+        drop(monitors);
+        self.allow_layer_recovery();
     }
 }
 
@@ -521,3 +653,5 @@ sctk::delegate_registry!(WinitState);
 sctk::delegate_shm!(WinitState);
 sctk::delegate_xdg_shell!(WinitState);
 sctk::delegate_xdg_window!(WinitState);
+
+sctk::delegate_layer!(WinitState);

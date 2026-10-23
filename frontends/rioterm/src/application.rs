@@ -197,9 +197,8 @@ fn title_tracks_size(config: &rio_backend::config::Config) -> bool {
 impl Application<'_> {
     /// Register a system-wide hotkey for every `ToggleQuake` binding
     /// in the config, so the quake window opens while Rio is
-    /// unfocused. No-op when quake is not bound; pure Wayland has no
-    /// global hotkey API, the compositor keybinding + a regular
-    /// binding cover it there.
+    /// unfocused. Wayland uses the XDG Desktop Portal GlobalShortcuts
+    /// interface; other platforms use their native global-hotkey API.
     fn setup_quake_hotkey(&mut self) {
         // Drop any previous manager first: registering a chord the old
         // manager still holds fails on Windows and X11.
@@ -212,14 +211,38 @@ impl Application<'_> {
 
     /// The monitor the quake window should drop down on: the one
     /// under the mouse cursor where the platform can tell us, the
-    /// primary monitor otherwise.
+    /// focused window's output or an available monitor on Wayland, which
+    /// has neither a global cursor position nor a primary-monitor concept.
     fn quake_monitor(
         &self,
         event_loop: &ActiveEventLoop,
+        output_name: Option<&str>,
     ) -> Option<rio_window::monitor::MonitorHandle> {
+        if let Some(name) = output_name {
+            if let Some(monitor) = event_loop
+                .available_monitors()
+                .find(|m| m.name().as_deref() == Some(name))
+            {
+                return Some(monitor);
+            }
+        }
         event_loop
             .cursor_monitor()
             .or_else(|| event_loop.primary_monitor())
+            .or_else(|| {
+                self.router
+                    .routes
+                    .values()
+                    .find(|route| route.window.winit_window.has_focus())
+                    .and_then(|route| route.window.winit_window.current_monitor())
+            })
+            .or_else(|| {
+                self.router
+                    .quake_window_id
+                    .and_then(|id| self.router.routes.get(&id))
+                    .and_then(|route| route.window.winit_window.current_monitor())
+            })
+            .or_else(|| event_loop.available_monitors().next())
     }
 
     /// Anchor the quake window to the top of `monitor`, horizontally
@@ -228,6 +251,8 @@ impl Application<'_> {
         &mut self,
         id: rio_backend::event::WindowId,
         event_loop: &ActiveEventLoop,
+        #[allow(unused_variables)] activation_token: Option<String>,
+        output_name: Option<&str>,
     ) {
         #[cfg(target_os = "macos")]
         {
@@ -239,7 +264,18 @@ impl Application<'_> {
             return;
         };
         let window = &route.window.winit_window;
-        if let Some(monitor) = self.quake_monitor(event_loop) {
+        let wayland = matches!(
+            event_loop.display_handle().unwrap().as_raw(),
+            raw_window_handle::RawDisplayHandle::Wayland(_)
+        );
+        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+        let quake_overlay = {
+            use rio_window::platform::wayland::WindowExtWayland;
+            window.is_quake_overlay()
+        };
+        #[cfg(not(all(feature = "wayland", not(any(target_os = "macos", windows)))))]
+        let quake_overlay = false;
+        if let Some(monitor) = self.quake_monitor(event_loop, output_name) {
             let msize = monitor.size();
             let mpos = monitor.position();
             let width = (msize.width as f32
@@ -249,6 +285,45 @@ impl Application<'_> {
                 * self.config.window.quake_height_percentage.clamp(0.1, 1.0))
                 as u32;
             let x = mpos.x + (msize.width.saturating_sub(width) / 2) as i32;
+            if wayland {
+                let size = crate::router::quake_size(
+                    &self.config.window,
+                    msize,
+                    monitor.scale_factor(),
+                );
+                if quake_overlay {
+                    #[cfg(all(
+                        feature = "wayland",
+                        not(any(target_os = "macos", windows))
+                    ))]
+                    {
+                        use rio_window::platform::wayland::WindowExtWayland;
+                        // An explicit output comes from the shortcut's captured
+                        // compositor context, never from the old quake window.
+                        // Otherwise let layer-shell choose the active output.
+                        let output = output_name.and_then(|name| {
+                            (monitor.name().as_deref() == Some(name))
+                                .then(|| monitor.clone())
+                        });
+                        window.prepare_quake_overlay(size, output);
+                    }
+                } else {
+                    window.set_fullscreen(
+                        if crate::router::quake_fills_monitor(&self.config.window) {
+                            Some(Fullscreen::Borderless(Some(monitor.clone())))
+                        } else {
+                            None
+                        },
+                    );
+                    window.set_resizable(true);
+                    window.set_min_inner_size(None::<rio_window::dpi::LogicalSize<f64>>);
+                    window.set_max_inner_size(None::<rio_window::dpi::LogicalSize<f64>>);
+                    let _ = window.request_inner_size(size);
+                    window.set_min_inner_size(Some(size));
+                    window.set_max_inner_size(Some(size));
+                    window.set_resizable(false);
+                }
+            }
             #[cfg(target_os = "macos")]
             {
                 let scale = monitor.scale_factor();
@@ -260,7 +335,7 @@ impl Application<'_> {
                 window.set_outer_position(pos);
             }
             #[cfg(not(target_os = "macos"))]
-            {
+            if !wayland {
                 let _ = window.request_inner_size(rio_window::dpi::PhysicalSize::new(
                     width, height,
                 ));
@@ -270,11 +345,34 @@ impl Application<'_> {
             }
         }
         window.set_visible(true);
-        window.focus_window();
+        if wayland {
+            // When supplied, the portal token also authorizes focus. Mapping
+            // the surface itself must not depend on a token: not all portal
+            // backends supply one.
+            #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+            if !quake_overlay {
+                if let Some(token) = activation_token {
+                    use rio_window::platform::wayland::WindowExtWayland;
+                    window.activate_with_token(token);
+                }
+            }
+        } else {
+            window.focus_window();
+        }
     }
 
-    /// Show, focus or hide the quake window; create it on first use.
-    fn toggle_quake_window(&mut self, event_loop: &ActiveEventLoop) {
+    /// Show or hide the quake window; create it on first use.
+    fn toggle_quake_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        activation_token: Option<String>,
+        output_name: Option<String>,
+    ) {
+        // A local binding in another Rio must not create a second quake window.
+        if !crate::global_hotkey::owns_quake() {
+            return;
+        }
+
         let quake_id = self
             .router
             .quake_window_id
@@ -282,13 +380,20 @@ impl Application<'_> {
 
         let Some(id) = quake_id else {
             self.router.quake_window_id = None;
+            let monitor = self.quake_monitor(event_loop, output_name.as_deref());
             self.router.create_quake_window(
                 event_loop,
                 self.event_proxy.clone(),
                 &self.config,
+                monitor,
             );
             if let Some(id) = self.router.quake_window_id {
-                self.show_quake_window(id, event_loop);
+                self.show_quake_window(
+                    id,
+                    event_loop,
+                    activation_token,
+                    output_name.as_deref(),
+                );
             }
             return;
         };
@@ -296,16 +401,19 @@ impl Application<'_> {
         if let Some(route) = self.router.routes.get_mut(&id) {
             let window = &route.window.winit_window;
             let visible = window.is_visible().unwrap_or(true);
-            if !visible {
-                self.show_quake_window(id, event_loop);
-            } else if window.has_focus() {
+            if visible {
                 window.set_visible(false);
                 #[cfg(target_os = "macos")]
                 if let Some(pid) = self.quake_previous_app.take() {
                     rio_window::platform::macos::activate_application(pid);
                 }
             } else {
-                self.show_quake_window(id, event_loop);
+                self.show_quake_window(
+                    id,
+                    event_loop,
+                    activation_token,
+                    output_name.as_deref(),
+                );
             }
         }
     }
@@ -587,11 +695,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 let (config, config_error) = match rio_backend::config::Config::try_load()
                 {
                     Ok(config) => (config, None),
-                    Err(error) => (rio_backend::config::Config::default(), Some(error)),
+                    // A partial/invalid live edit must not discard the last
+                    // good config and silently unregister the quake shortcut.
+                    Err(error) => (self.config.clone(), Some(error)),
                 };
 
                 let has_font_updates = self.config.fonts != config.fonts;
-                let has_binding_updates = self.config.bindings != config.bindings;
+                let has_quake_binding_updates =
+                    crate::global_hotkey::quake_bindings_changed(
+                        &self.config.bindings.keys,
+                        &config.bindings.keys,
+                    );
 
                 let font_library_errors = if has_font_updates {
                     let new_font_library = rio_backend::sugarloaf::font::FontLibrary::new(
@@ -606,9 +720,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 self.config = config;
                 self.title_tracks_size = title_tracks_size(&self.config);
 
-                // Dropping the old manager unregisters its hotkeys, so
-                // ToggleQuake binding edits apply without restarting.
-                if has_binding_updates {
+                // Unrelated key bindings must not disturb the live portal
+                // session or the desktop's assigned quake shortcut.
+                if has_quake_binding_updates {
                     self.setup_quake_hotkey();
                 }
 
@@ -1006,7 +1120,13 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 );
             }
             RioEventType::Rio(RioEvent::ToggleQuake) => {
-                self.toggle_quake_window(event_loop);
+                self.toggle_quake_window(event_loop, None, None);
+            }
+            RioEventType::Rio(RioEvent::ToggleQuakeFromPortal {
+                activation_token,
+                output_name,
+            }) => {
+                self.toggle_quake_window(event_loop, activation_token, output_name);
             }
             #[cfg(target_os = "macos")]
             RioEventType::Rio(RioEvent::CreateNativeTab(working_dir_overwrite)) => {
