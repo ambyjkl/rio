@@ -15,6 +15,27 @@ pub const DEFAULT_MINIMUM_WINDOW_WIDTH: i32 = 300;
 ))]
 pub const APPLICATION_ID: &str = "Rio";
 
+/// Convert monitor-relative quake dimensions to logical window coordinates.
+/// Applying the monitor scale here also handles the initial Wayland configure,
+/// before the surface has entered an output and acquired its own scale factor.
+pub(crate) fn quake_size(
+    config: &rio_backend::config::window::Window,
+    monitor_size: rio_window::dpi::PhysicalSize<u32>,
+    scale: f64,
+) -> rio_window::dpi::LogicalSize<f64> {
+    let monitor_size: rio_window::dpi::LogicalSize<f64> = monitor_size.to_logical(scale);
+    rio_window::dpi::LogicalSize::new(
+        (monitor_size.width * config.quake_width_percentage.clamp(0.1, 1.0) as f64)
+            .max(1.0),
+        (monitor_size.height * config.quake_height_percentage.clamp(0.1, 1.0) as f64)
+            .max(1.0),
+    )
+}
+
+pub(crate) fn quake_fills_monitor(config: &rio_backend::config::window::Window) -> bool {
+    config.quake_width_percentage >= 1.0 && config.quake_height_percentage >= 1.0
+}
+
 pub fn create_window_builder(
     title: &str,
     config: &Config,
@@ -32,15 +53,19 @@ pub fn create_window_builder(
 
     let mut window_builder = WindowAttributes::default()
         .with_title(title)
-        .with_min_inner_size(rio_window::dpi::LogicalSize {
-            width: DEFAULT_MINIMUM_WINDOW_WIDTH,
-            height: DEFAULT_MINIMUM_WINDOW_HEIGHT,
-        })
         .with_resizable(true)
         .with_decorations(true)
         .with_transparent(config.window.opacity < 1.)
         .with_blur(config.window.blur.into())
         .with_window_icon(Some(icon));
+
+    if !quake {
+        window_builder =
+            window_builder.with_min_inner_size(rio_window::dpi::LogicalSize {
+                width: DEFAULT_MINIMUM_WINDOW_WIDTH,
+                height: DEFAULT_MINIMUM_WINDOW_HEIGHT,
+            });
+    }
 
     if quake {
         window_builder = window_builder
@@ -153,7 +178,12 @@ pub fn create_window_builder(
     // The quake window ignores `window.mode`: a fullscreen or
     // maximized mode would defeat the dropdown, and its geometry is
     // recomputed from the target monitor on every show anyway.
-    if !quake {
+    if quake {
+        window_builder = window_builder.with_inner_size(rio_window::dpi::LogicalSize {
+            width: config.window.width,
+            height: config.window.height,
+        });
+    } else {
         match config.window.mode {
             WindowMode::Fullscreen => {
                 window_builder =
@@ -284,4 +314,46 @@ pub fn configure_window(winit_window: &Window, config: &Config) {
     }
 
     winit_window.set_blur(config.window.blur.into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_window::dpi::{LogicalSize, PhysicalSize};
+
+    #[test]
+    fn quake_size_uses_percentages_and_monitor_scale() {
+        let mut config = rio_backend::config::window::Window::default();
+        config.quake_width_percentage = 1.0;
+        config.quake_height_percentage = 1.0;
+        assert!(quake_fills_monitor(&config));
+        assert_eq!(
+            quake_size(&config, PhysicalSize::new(3840, 2160), 2.0),
+            LogicalSize::new(1920.0, 1080.0)
+        );
+
+        config.quake_width_percentage = 0.5;
+        config.quake_height_percentage = 0.25;
+        assert!(!quake_fills_monitor(&config));
+        assert_eq!(
+            quake_size(&config, PhysicalSize::new(3840, 2160), 2.0),
+            LogicalSize::new(960.0, 270.0)
+        );
+    }
+
+    #[test]
+    fn quake_builder_uses_initial_geometry_even_with_fullscreen_mode() {
+        let mut config = Config::default();
+        config.window.width = 1920;
+        config.window.height = 1080;
+        config.window.mode = WindowMode::Fullscreen;
+        let attributes = create_window_builder("quake", &config, None, None, true);
+        assert_eq!(
+            attributes.inner_size,
+            Some(LogicalSize::new(1920, 1080).into())
+        );
+        assert!(attributes.fullscreen.is_none());
+        assert!(!attributes.maximized);
+        assert!(attributes.min_inner_size.is_none());
+    }
 }

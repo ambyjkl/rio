@@ -77,6 +77,8 @@ impl ApplicationName {
 pub struct PlatformSpecificWindowAttributes {
     pub name: Option<ApplicationName>,
     pub activation_token: Option<ActivationToken>,
+    #[cfg(wayland_platform)]
+    pub quake_overlay: bool,
     #[cfg(x11_platform)]
     pub x11: X11WindowAttributes,
 }
@@ -100,6 +102,8 @@ impl Default for PlatformSpecificWindowAttributes {
         Self {
             name: None,
             activation_token: None,
+            #[cfg(wayland_platform)]
+            quake_overlay: false,
             #[cfg(x11_platform)]
             x11: X11WindowAttributes {
                 visual_id: None,

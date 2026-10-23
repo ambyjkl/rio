@@ -45,6 +45,7 @@ smol_str = { workspace = true }
 tracing = { version = "0.1.40", default-features = false }
 
 [dev-dependencies]
+serde_json = "1"
 image = { version = "0.25.0", default-features = false, features = ["png"] }
 tracing = { version = "0.1.40", default-features = false, features = ["log"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
@@ -155,7 +156,7 @@ features = [
 ahash = { version = "0.8.7", features = ["no-rng"], optional = true }
 bytemuck = { version = "1.13.1", default-features = false, optional = true }
 calloop = "0.13.0"
-zbus = { workspace = true, features = ["blocking"] }
+zbus = { workspace = true, features = ["blocking-api"] }
 libc = { workspace = true }
 memmap2 = { workspace = true, optional = true }
 percent-encoding = { version = "2.0", optional = true }

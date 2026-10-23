@@ -177,6 +177,12 @@ pub enum RioEvent {
     UpdateConfig,
     CreateWindow,
     ToggleQuake,
+    /// Global shortcut activation with compositor focus permission and the
+    /// output that was active when the shortcut was pressed.
+    ToggleQuakeFromPortal {
+        activation_token: Option<String>,
+        output_name: Option<String>,
+    },
     CloseWindow,
     CreateNativeTab(Option<String>),
     CreateConfigEditor,
@@ -367,6 +373,7 @@ impl Debug for RioEvent {
             }
             RioEvent::CreateWindow => write!(f, "CreateWindow"),
             RioEvent::ToggleQuake => write!(f, "ToggleQuake"),
+            RioEvent::ToggleQuakeFromPortal { .. } => write!(f, "ToggleQuakeFromPortal"),
             RioEvent::CloseWindow => write!(f, "CloseWindow"),
             RioEvent::CreateNativeTab(_) => write!(f, "CreateNativeTab"),
             RioEvent::SelectNativeTabByIndex(tab_index) => {
