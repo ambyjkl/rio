@@ -835,6 +835,20 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .position(|grid| grid.get_by_route_id(route_id).is_some())
     }
 
+    /// Select a pane by persistent PTY identity, across all tabs and splits.
+    /// Unknown (already closed) panes leave the current selection unchanged.
+    pub fn select_route(&mut self, route_id: usize) -> bool {
+        let Some(index) = self
+            .contexts
+            .iter_mut()
+            .position(|grid| grid.select_route(route_id))
+        else {
+            return false;
+        };
+        self.set_current(index);
+        true
+    }
+
     /// A pane rang the bell. Flags its tab so the strip can surface it.
     /// The current tab is skipped only while the window has focus: the
     /// user is already looking at it then, but a ring in the visible

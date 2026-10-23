@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod compute_tests;
+#[cfg(test)]
+mod route_tests;
 
 use crate::context::Context;
 use crate::mouse::Mouse;
@@ -250,6 +252,19 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     #[allow(dead_code)]
     pub fn get_mut(&mut self, key: NodeId) -> Option<&mut ContextGridItem<T>> {
         self.inner.get_mut(&key)
+    }
+
+    /// Select the pane owning this PTY, independently of its layout position.
+    pub fn select_route(&mut self, route_id: usize) -> bool {
+        let Some((&node, _)) = self
+            .inner
+            .iter()
+            .find(|(_, item)| item.val.route_id == route_id)
+        else {
+            return false;
+        };
+        self.current = node;
+        true
     }
 
     /// Get item by route_id (used for event routing)

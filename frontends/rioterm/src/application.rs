@@ -30,6 +30,9 @@ use rio_window::window::{CursorIcon, Fullscreen};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
+#[cfg(all(test, feature = "wayland", target_os = "linux"))]
+mod notification_tests;
+
 pub struct Application<'a> {
     config: rio_backend::config::Config,
     /// The title template shows `{{columns}}`/`{{lines}}`, so a resize
@@ -150,8 +153,89 @@ impl Application<'_> {
         }
     }
 
-    fn handle_desktop_notification(&self, title: &str, body: &str) {
-        rio_notifier::send_notification(title, body);
+    fn handle_desktop_notification(
+        &self,
+        window_id: rio_backend::event::WindowId,
+        route_id: usize,
+        title: &str,
+        body: &str,
+    ) {
+        let event_proxy = self.event_proxy.clone();
+        rio_notifier::send_notification_with_activation(
+            title,
+            body,
+            move |activation_token| {
+                event_proxy.send_event(
+                    RioEventType::Rio(RioEvent::FocusWindowFromNotification {
+                        route_id,
+                        activation_token,
+                    }),
+                    window_id,
+                );
+            },
+        );
+    }
+
+    fn focus_notification_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: rio_backend::event::WindowId,
+        route_id: usize,
+        #[allow(unused_variables)] activation_token: Option<String>,
+    ) {
+        // Resolve the persistent pane id at click time: tab indices and split
+        // positions may have changed since delivery. Stale clicks must neither
+        // create replacements nor focus an unrelated surviving terminal.
+        let Some(route) = self.router.routes.get_mut(&window_id) else {
+            return;
+        };
+        if !route
+            .window
+            .screen
+            .focus_terminal(route_id, &mut self.router.clipboard)
+        {
+            return;
+        }
+        route.sync_window_title();
+        if self.router.quake_window_id == Some(window_id) {
+            // Renew an unfocused layer's keyboard focus as well as showing
+            // hidden quake windows. Never toggle: a click must not hide quake.
+            #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+            {
+                use rio_window::platform::wayland::WindowExtWayland;
+                let window = &self.router.routes[&window_id].window.winit_window;
+                if window.is_quake_overlay() && !window.has_focus() {
+                    window.set_visible(false);
+                }
+            }
+            self.show_quake_window(window_id, event_loop, None, None);
+        } else if let Some(quake) = self
+            .router
+            .quake_window_id
+            .and_then(|id| self.router.routes.get(&id))
+        {
+            // A mapped quake layer can retain exclusive keyboard focus and
+            // cover the ordinary terminal which the notification came from.
+            quake.window.winit_window.set_visible(false);
+        }
+
+        let Some(route) = self.router.routes.get(&window_id) else {
+            return;
+        };
+        let window = &route.window.winit_window;
+        window.set_visible(true);
+        if window.is_minimized() == Some(true) {
+            window.set_minimized(false);
+        }
+        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+        if let Some(token) = activation_token {
+            use rio_window::platform::wayland::WindowExtWayland;
+            // A notification click authorizes normal Wayland window activation.
+            // Layer-shell quake windows also acquire focus when mapped above.
+            window.activate_with_token(token);
+        }
+        window.focus_window();
+        window.request_redraw();
     }
 
     pub fn run(
@@ -918,8 +1002,23 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
             }
-            RioEventType::Rio(RioEvent::DesktopNotification { title, body }) => {
-                self.handle_desktop_notification(&title, &body);
+            RioEventType::Rio(RioEvent::DesktopNotification {
+                route_id,
+                title,
+                body,
+            }) => {
+                self.handle_desktop_notification(window_id, route_id, &title, &body);
+            }
+            RioEventType::Rio(RioEvent::FocusWindowFromNotification {
+                route_id,
+                activation_token,
+            }) => {
+                self.focus_notification_window(
+                    event_loop,
+                    window_id,
+                    route_id,
+                    activation_token,
+                );
             }
             RioEventType::Rio(RioEvent::PrepareRender(millis)) => {
                 if let Some(route) = self.router.routes.get(&window_id) {
