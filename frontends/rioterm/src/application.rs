@@ -30,6 +30,9 @@ use rio_window::window::{CursorIcon, Fullscreen};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
+#[cfg(all(test, feature = "wayland", target_os = "linux"))]
+mod primary_selection_tests;
+
 pub struct Application<'a> {
     config: rio_backend::config::Config,
     /// The title template shows `{{columns}}`/`{{lines}}`, so a resize
@@ -1599,10 +1602,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             return;
                         }
 
-                        // Releasing a drag selection copies it (with
-                        // copy-on-select) and must not activate a hint
-                        // sitting under the release point; hints fire on
-                        // plain clicks only, when no selection exists.
+                        // Releasing a selection publishes PRIMARY (and, with
+                        // copy-on-select, CLIPBOARD). Do not activate a hint
+                        // under the release point; hints fire on plain clicks
+                        // only, when no selection exists.
                         if route.window.screen.selection_is_empty() {
                             if button == MouseButton::Left {
                                 // Only a latched press opens a link, and only
@@ -1643,12 +1646,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                 }
                             }
                         } else if matches!(button, MouseButton::Left | MouseButton::Right)
-                            && self.config.copy_on_select
                         {
                             route.window.screen.copy_selection(
-                                ClipboardType::Clipboard,
+                                ClipboardType::Selection,
                                 &mut self.router.clipboard,
                             );
+                            if self.config.copy_on_select {
+                                route.window.screen.copy_selection(
+                                    ClipboardType::Clipboard,
+                                    &mut self.router.clipboard,
+                                );
+                            }
                         }
                     }
                 }

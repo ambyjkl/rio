@@ -61,6 +61,10 @@ cpal = { version = "0.15", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
 [build-dependencies]
 cfg_aliases = "0.2.1"
 

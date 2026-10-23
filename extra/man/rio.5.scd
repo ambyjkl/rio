@@ -36,6 +36,17 @@ On Windows, the config file will be looked for in:
 
 	Default: _true_
 
+*copy-on-select* = _true_ | _false_
+
+	Copy completed mouse selections to the regular clipboard.
+
+	On X11 and Wayland compositors supporting PRIMARY, completing a non-empty
+	mouse selection always updates PRIMARY, independently of this setting.
+	Middle-click pastes PRIMARY; enabling this option additionally updates
+	the regular clipboard used by copy/paste shortcuts.
+
+	Default: _false_
+
 *draw-bold-text-with-light-colors* = _true_ | _false_
 
 	When _true_, bold text is drawn using the bright color variants.
