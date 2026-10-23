@@ -322,6 +322,15 @@ Default: _"Tab"_
 
 	Default: _false_
 
+*current-working-directory* = _true_ | _false_
+
+	On Unix, new tabs and splits inherit the root shell process's current
+	directory, not a foreground command's directory. Applies with both
+	*use-fork* = _true_ and *use-fork* = _false_. When disabled, or if the
+	shell's directory cannot be read, the configured working directory is used.
+
+	Default: _true_
+
 *color-automation* = [{ program = _"<string>"_, path = _"<string>"_, color = _"<string>"_ },]
 
 	Automatic color assignment based on program or path.
