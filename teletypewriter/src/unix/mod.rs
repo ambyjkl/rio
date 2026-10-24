@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
 mod child;
+#[cfg(test)]
+mod fork_tests;
 #[cfg(target_os = "macos")]
 mod macos;
 mod signals;
@@ -757,15 +759,22 @@ pub fn default_shell_program() -> String {
         .unwrap_or_default()
 }
 
+/// Fork a shell in `working_directory`, or inherit Rio's directory when unset.
+/// A directory change failure exits the child with status 127, like exec failure.
+#[allow(clippy::too_many_arguments)]
 pub fn create_pty_with_fork(
     shell: Option<&str>,
     args: &[String],
+    working_directory: &Option<String>,
     envs: &[(String, String)],
     columns: u16,
     rows: u16,
     width: u16,
     height: u16,
 ) -> Result<Pty, Error> {
+    // Validate and allocate before fork; only chdir runs in the child.
+    let working_directory = working_directory.as_deref().map(CString::new).transpose()?;
+
     let mut main = 0;
     let winsize = Winsize {
         ws_row: rows as libc::c_ushort,
@@ -801,6 +810,13 @@ pub fn create_pty_with_fork(
         )
     } {
         0 => {
+            if let Some(directory) = &working_directory {
+                if unsafe { libc::chdir(directory.as_ptr()) } == -1 {
+                    // Do not run the shell in an unintended directory or return
+                    // into the terminal application when chdir fails.
+                    unsafe { libc::_exit(127) }
+                }
+            }
             set_child_envs(envs);
             default_shell_command(shell_program, args);
             // Never return into the terminal application in the forked child
