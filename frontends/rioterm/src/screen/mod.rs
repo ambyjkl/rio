@@ -1281,6 +1281,12 @@ impl Screen<'_> {
                     Act::SplitDown => {
                         self.split_down();
                     }
+                    Act::SplitAuto => {
+                        self.split_auto();
+                    }
+                    Act::SplitEqualize => {
+                        self.split_equalize();
+                    }
                     Act::MoveDividerUp => {
                         // User wants divider to move up visually, which means expanding the bottom split
                         self.move_divider_down();
@@ -1496,6 +1502,21 @@ impl Screen<'_> {
                         self.context_manager.select_prev_split();
                         self.mark_dirty();
                     }
+                    Act::SelectLeftSplit
+                    | Act::SelectRightSplit
+                    | Act::SelectUpSplit
+                    | Act::SelectDownSplit => {
+                        self.cancel_search(clipboard);
+                        let (dx, dy) = match action {
+                            Act::SelectLeftSplit => (-1.0, 0.0),
+                            Act::SelectRightSplit => (1.0, 0.0),
+                            Act::SelectUpSplit => (0.0, -1.0),
+                            Act::SelectDownSplit => (0.0, 1.0),
+                            _ => unreachable!(),
+                        };
+                        self.context_manager.select_split_direction(dx, dy);
+                        self.mark_dirty();
+                    }
                     Act::SelectNextSplitOrTab => {
                         self.cancel_search(clipboard);
                         self.clear_selection();
@@ -1651,6 +1672,21 @@ impl Screen<'_> {
 
         self.refresh_titles();
         self.mark_dirty();
+    }
+
+    pub fn split_auto(&mut self) {
+        if self.context_manager.current_grid().auto_split_down() {
+            self.split_down();
+        } else {
+            self.split_right();
+        }
+    }
+
+    pub fn split_equalize(&mut self) {
+        if self.context_manager.split_equalize(&mut self.sugarloaf) {
+            self.mark_dirty();
+            self.renderer.trail_cursor.snap();
+        }
     }
 
     pub fn move_divider_up(&mut self) {
@@ -3461,17 +3497,19 @@ impl Screen<'_> {
         }
     }
 
-    fn sgr_mouse_report(&mut self, pos: Pos, button: u8, state: ElementState) {
+    fn sgr_mouse_report(
+        context: &context::Context<EventProxy>,
+        pos: Pos,
+        button: u8,
+        state: ElementState,
+    ) {
         let c = match state {
             ElementState::Pressed => 'M',
             ElementState::Released => 'm',
         };
 
         let msg = format!("\x1b[<{};{};{}{}", button, pos.col + 1, pos.row + 1, c);
-        self.ctx_mut()
-            .current_mut()
-            .messenger
-            .send_write(msg.into_bytes());
+        context.messenger.send_write(msg.into_bytes());
     }
 
     #[inline]
@@ -3487,12 +3525,39 @@ impl Screen<'_> {
 
     #[inline]
     pub fn mouse_report(&mut self, button: u8, state: ElementState) {
-        let terminal = self.ctx().current().terminal.lock();
+        self.mouse_report_in_context(self.ctx().current_grid().current, button, state);
+    }
+
+    fn mouse_report_in_context(
+        &self,
+        context_id: taffy::NodeId,
+        button: u8,
+        state: ElementState,
+    ) {
+        let grid = self.ctx().current_grid();
+        let Some(item) = grid.contexts().get(&context_id) else {
+            return;
+        };
+        let context = item.context();
+        let terminal = context.terminal.lock();
         let display_offset = terminal.display_offset();
         let mode = terminal.mode();
         drop(terminal);
 
-        let pos = self.mouse_position(display_offset);
+        let mut margin = grid.get_scaled_margin();
+        if grid.contexts().len() > 1 {
+            margin.left += item.layout_rect[0];
+            margin.top += item.layout_rect[1];
+        }
+        let dimension = context.dimension;
+        let pos = calculate_mouse_position(
+            &self.mouse,
+            display_offset,
+            (dimension.columns, dimension.lines),
+            margin.left,
+            margin.top,
+            (dimension.cell.cell_width, dimension.cell.cell_height),
+        );
 
         // Assure the mouse pos is not in the scrollback.
         if pos.row < 0 {
@@ -3508,9 +3573,9 @@ impl Screen<'_> {
         if mode.contains(Mode::MOUSE_REPORT_X10) {
             if state == ElementState::Pressed && button <= 2 {
                 if mode.contains(Mode::SGR_MOUSE) {
-                    self.sgr_mouse_report(pos, button, state);
+                    Self::sgr_mouse_report(context, pos, button, state);
                 } else {
-                    self.normal_mouse_report(pos, button);
+                    Self::normal_mouse_report(context, pos, button);
                 }
             }
 
@@ -3532,18 +3597,22 @@ impl Screen<'_> {
 
         // Report mouse events.
         if mode.contains(Mode::SGR_MOUSE) {
-            self.sgr_mouse_report(pos, button + mods, state);
+            Self::sgr_mouse_report(context, pos, button + mods, state);
         } else if let ElementState::Released = state {
-            self.normal_mouse_report(pos, 3 + mods);
+            Self::normal_mouse_report(context, pos, 3 + mods);
         } else {
-            self.normal_mouse_report(pos, button + mods);
+            Self::normal_mouse_report(context, pos, button + mods);
         }
     }
 
     #[inline]
-    fn normal_mouse_report(&mut self, position: Pos, button: u8) {
+    fn normal_mouse_report(
+        context: &context::Context<EventProxy>,
+        position: Pos,
+        button: u8,
+    ) {
         let Pos { row, col } = position;
-        let utf8 = self.get_mode().contains(Mode::UTF8_MOUSE);
+        let utf8 = context.terminal.lock().mode().contains(Mode::UTF8_MOUSE);
 
         let max_point = if utf8 { 2015 } else { 223 };
 
@@ -3572,7 +3641,7 @@ impl Screen<'_> {
             msg.push(32 + 1 + row.0 as u8);
         }
 
-        self.ctx_mut().current_mut().messenger.send_write(msg);
+        context.messenger.send_write(msg);
     }
 
     #[inline]
@@ -3612,15 +3681,36 @@ impl Screen<'_> {
 
     #[inline]
     pub fn scroll(&mut self, new_scroll_x_px: f64, new_scroll_y_px: f64) {
+        self.scroll_in_context(
+            self.ctx().current_grid().current,
+            new_scroll_x_px,
+            new_scroll_y_px,
+        );
+    }
+
+    pub fn scroll_in_context(
+        &mut self,
+        context_id: taffy::NodeId,
+        new_scroll_x_px: f64,
+        new_scroll_y_px: f64,
+    ) {
         // Scrolling slides different text under the pointer while the
         // viewport cell stays the same, so the hover-probe dedup key
         // must not suppress the next probe.
         self.last_hint_probe = None;
 
-        let dim = self.context_manager.current().dimension.dimension;
+        let Some(item) = self.ctx().current_grid().contexts().get(&context_id) else {
+            return;
+        };
+        let dim = item.context().dimension.dimension;
+        let route_id = item.context().route_id;
+        let mode = item.context().terminal.lock().mode();
         let width = dim.width as f64;
         let height = dim.height as f64;
-        let mode = self.get_mode();
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        self.mouse.set_scroll_target(route_id);
 
         const MOUSE_WHEEL_UP: u8 = 64;
         const MOUSE_WHEEL_DOWN: u8 = 65;
@@ -3639,7 +3729,7 @@ impl Screen<'_> {
             let lines = (self.mouse.accumulated_scroll.y / height).abs() as usize;
 
             for _ in 0..lines {
-                self.mouse_report(code, ElementState::Pressed);
+                self.mouse_report_in_context(context_id, code, ElementState::Pressed);
             }
 
             let code = if new_scroll_x_px > 0. {
@@ -3650,7 +3740,7 @@ impl Screen<'_> {
             let columns = (self.mouse.accumulated_scroll.x / width).abs() as usize;
 
             for _ in 0..columns {
-                self.mouse_report(code, ElementState::Pressed);
+                self.mouse_report_in_context(context_id, code, ElementState::Pressed);
             }
         } else if mode.contains(Mode::ALT_SCREEN | Mode::ALTERNATE_SCROLL)
             && !self.modifiers.state().shift_key()
@@ -3683,7 +3773,10 @@ impl Screen<'_> {
             }
 
             if !content.is_empty() {
-                self.ctx_mut().current_mut().messenger.send_write(content);
+                self.ctx().current_grid().contexts()[&context_id]
+                    .context()
+                    .messenger
+                    .send_write(content);
             }
         } else {
             self.mouse.accumulated_scroll.y +=
@@ -3691,11 +3784,25 @@ impl Screen<'_> {
             let lines = (self.mouse.accumulated_scroll.y / height) as i32;
 
             if lines != 0 {
-                let current = self.context_manager.current_mut();
-                let rich_text_id = current.rich_text_id;
-                let mut terminal = current.terminal.lock();
+                let target = self
+                    .ctx_mut()
+                    .current_grid_mut()
+                    .contexts_mut()
+                    .get_mut(&context_id)
+                    .unwrap()
+                    .context_mut();
+                let rich_text_id = target.rich_text_id;
+                let mut terminal = target.terminal.lock();
+                let old_offset = terminal.display_offset();
                 terminal.scroll_display(Scroll::Delta(lines));
+                let changed = terminal.display_offset() != old_offset;
                 drop(terminal);
+                if changed {
+                    target
+                        .renderable_content
+                        .pending_update
+                        .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+                }
                 self.renderer.scrollbar.notify_scroll(rich_text_id);
             }
         }
@@ -3806,11 +3913,26 @@ impl Screen<'_> {
             }
             PaletteAction::SplitRight => self.split_right(),
             PaletteAction::SplitDown => self.split_down(),
+            PaletteAction::SplitAuto => self.split_auto(),
+            PaletteAction::SplitEqualize => self.split_equalize(),
             PaletteAction::SelectNextSplit => {
                 self.context_manager.select_next_split();
             }
             PaletteAction::SelectPrevSplit => {
                 self.context_manager.select_prev_split();
+            }
+            PaletteAction::SelectLeftSplit
+            | PaletteAction::SelectRightSplit
+            | PaletteAction::SelectUpSplit
+            | PaletteAction::SelectDownSplit => {
+                let (dx, dy) = match action {
+                    PaletteAction::SelectLeftSplit => (-1.0, 0.0),
+                    PaletteAction::SelectRightSplit => (1.0, 0.0),
+                    PaletteAction::SelectUpSplit => (0.0, -1.0),
+                    PaletteAction::SelectDownSplit => (0.0, 1.0),
+                    _ => unreachable!(),
+                };
+                self.context_manager.select_split_direction(dx, dy);
             }
             PaletteAction::CloseCurrentSplitOrTab => self.close_split_or_tab(clipboard),
             PaletteAction::ConfigEditor => {

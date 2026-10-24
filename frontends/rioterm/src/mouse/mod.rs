@@ -27,6 +27,8 @@ pub struct Mouse {
     pub last_click_button: MouseButton,
     pub click_state: ClickState,
     pub accumulated_scroll: AccumulatedScroll,
+    /// Pane whose fractional wheel/touchpad delta is being accumulated.
+    pub scroll_target: Option<usize>,
     pub square_side: Side,
     pub inside_text_area: bool,
     /// Cursor X in physical pixels. `f64` so subpixel precision from
@@ -67,6 +69,7 @@ impl Default for Mouse {
             inside_text_area: Default::default(),
             on_border: false,
             accumulated_scroll: AccumulatedScroll::default(),
+            scroll_target: None,
             x: 0.0,
             y: 0.0,
             raw_y: 0.0,
@@ -82,6 +85,14 @@ impl Mouse {
             multiplier,
             divider,
             ..Default::default()
+        }
+    }
+
+    /// Fractional motion must not leak from one pane into another.
+    pub fn set_scroll_target(&mut self, route_id: usize) {
+        if self.scroll_target != Some(route_id) {
+            self.accumulated_scroll = AccumulatedScroll::default();
+            self.scroll_target = Some(route_id);
         }
     }
 
@@ -181,6 +192,21 @@ pub mod test {
             y,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn scroll_accumulation_stays_with_its_target_pane() {
+        let mut mouse = Mouse::default();
+        mouse.set_scroll_target(1);
+        mouse.accumulated_scroll.x = 2.5;
+        mouse.accumulated_scroll.y = 7.5;
+        mouse.set_scroll_target(1);
+        assert_eq!(mouse.accumulated_scroll.x, 2.5);
+        assert_eq!(mouse.accumulated_scroll.y, 7.5);
+
+        mouse.set_scroll_target(2);
+        assert_eq!(mouse.accumulated_scroll.x, 0.0);
+        assert_eq!(mouse.accumulated_scroll.y, 0.0);
     }
 
     /// Canonical stride: cell width = 9 (u32). Boundaries at 0, 9, 18, 27.

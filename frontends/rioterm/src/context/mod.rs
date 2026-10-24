@@ -646,6 +646,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
+    pub fn select_split_direction(&mut self, dx: f32, dy: f32) {
+        self.contexts[self.current_index].select_split_direction(dx, dy);
+        self.sync_current_route();
+    }
+
+    #[inline]
     pub fn select_next_split(&mut self) {
         self.contexts[self.current_index].select_next_split();
         self.sync_current_route();
@@ -686,6 +692,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             current_tab.current = last_key;
         }
         self.sync_current_route();
+    }
+
+    #[inline]
+    pub fn split_equalize(&mut self, sugarloaf: &mut Sugarloaf) -> bool {
+        self.contexts[self.current_index].split_equalize(sugarloaf)
     }
 
     #[inline]

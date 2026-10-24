@@ -292,6 +292,15 @@ action = "CreateWindow"
 *SplitVertically*
 	Split panel vertically.
 
+*SplitAuto*
+	Split the active pane along its longer pixel axis: right if its width is
+	greater than its height, otherwise down. No default binding.
+
+*SplitEqualize*
+	Equalize all splits in the active tab. Nested splits along the same axis
+	receive equal shares; a perpendicular subtree counts as one share.
+	No default binding.
+
 *ClosePanel*
 	Close current split panel.
 
