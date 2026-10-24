@@ -3884,12 +3884,13 @@ impl Screen<'_> {
         }
     }
 
-    pub(crate) fn render_welcome(&mut self) {
+    pub(crate) fn render_welcome(&mut self, window: &rio_window::window::Window) {
         crate::router::routes::welcome::screen(
             &mut self.sugarloaf,
             &self.context_manager.current().dimension,
         );
-        self.sugarloaf.render();
+        self.sugarloaf
+            .render_with_grids_and_pre_present(&mut [], || window.pre_present_notify());
     }
 
     pub fn execute_palette_action(
@@ -4018,7 +4019,10 @@ impl Screen<'_> {
         }
     }
 
-    pub(crate) fn render(&mut self) -> Option<crate::context::renderable::WindowUpdate> {
+    pub(crate) fn render(
+        &mut self,
+        window: &rio_window::window::Window,
+    ) -> Option<crate::context::renderable::WindowUpdate> {
         self.update_close_button_hover(self.mouse.x, self.mouse.y);
         if self.renderer.is_window_focused {
             self.context_manager.clear_current_bell();
@@ -4768,11 +4772,14 @@ impl Screen<'_> {
             }
 
             if should_present {
-                if frame_grids.is_empty() {
-                    self.sugarloaf.render();
-                } else {
-                    self.sugarloaf.render_with_grids(&mut frame_grids);
-                }
+                // Arm Wayland's frame callback only for a frame that is
+                // actually about to commit. rio-window coalesces redraws until
+                // the compositor signals readiness, rather than filling FIFO
+                // with obsolete frames while input/configure events arrive.
+                self.sugarloaf
+                    .render_with_grids_and_pre_present(&mut frame_grids, || {
+                        window.pre_present_notify()
+                    });
                 // A dropped frame (no drawable, e.g. right after wake)
                 // already consumed this frame's damage; without a retry
                 // the content is lost until unrelated PTY traffic.

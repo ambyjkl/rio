@@ -291,6 +291,7 @@ pub fn render_cpu(
     grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
     text: &crate::text::Text,
     images: &ImageLayers,
+    pre_present: &mut dyn FnMut(),
 ) {
     // Flatten and z-sort image overlays once. The sort is stable and
     // each panel's vec arrives ordered (z, image_id, placement_id)
@@ -555,6 +556,7 @@ pub fn render_cpu(
     // get hidden by panel borders or the cursor.
     text.render_cpu(&mut buffer, ctx.width_px, ctx.height_px);
 
+    pre_present();
     if let Err(e) = buffer.present() {
         tracing::error!("softbuffer present failed: {e}");
     }

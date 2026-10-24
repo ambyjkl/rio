@@ -2486,10 +2486,15 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                 match route.path {
                     RoutePath::Welcome => {
-                        route.window.screen.render_welcome();
+                        route
+                            .window
+                            .screen
+                            .render_welcome(&route.window.winit_window);
                     }
                     RoutePath::Terminal => {
-                        if let Some(window_update) = route.window.screen.render() {
+                        if let Some(window_update) =
+                            route.window.screen.render(&route.window.winit_window)
+                        {
                             use crate::context::renderable::{
                                 BackgroundState, WindowUpdate,
                             };
