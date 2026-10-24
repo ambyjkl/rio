@@ -400,16 +400,14 @@ impl Route<'_> {
                             self.request_overlay_redraw();
                         }
                         Key::Named(NamedKey::Backspace) => {
-                            let current_query =
-                                self.window.screen.renderer.command_palette.query.clone();
-                            if !current_query.is_empty() {
-                                let mut chars = current_query.chars().collect::<Vec<_>>();
-                                chars.pop();
-                                self.window
-                                    .screen
-                                    .renderer
-                                    .command_palette
-                                    .set_query(chars.into_iter().collect());
+                            let modifiers = self.window.screen.modifiers.state();
+                            if self
+                                .window
+                                .screen
+                                .renderer
+                                .command_palette
+                                .backspace_query(modifiers)
+                            {
                                 self.request_overlay_redraw();
                             }
                         }

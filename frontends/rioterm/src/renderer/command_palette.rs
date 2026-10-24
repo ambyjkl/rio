@@ -6,6 +6,7 @@
 use crate::renderer::scrollbar;
 use rio_backend::sugarloaf::text::DrawOpts;
 use rio_backend::sugarloaf::Sugarloaf;
+use rio_window::keyboard::ModifiersState;
 use std::time::Instant;
 
 /// Convert `[f32; 4]` colour to `[u8; 4]` for the `Text` API (the
@@ -555,6 +556,31 @@ impl CommandPalette {
         true
     }
 
+    /// Delete one character, the previous whitespace-delimited word (Ctrl),
+    /// or the entire query (Cmd on macOS). Returns whether the query changed.
+    pub fn backspace_query(&mut self, modifiers: ModifiersState) -> bool {
+        if self.query.is_empty() {
+            return false;
+        }
+
+        let mut query = std::mem::take(&mut self.query);
+        if cfg!(target_os = "macos") && modifiers.super_key() {
+            query.clear();
+        } else if modifiers.control_key() {
+            let word_start = query
+                .trim_end()
+                .char_indices()
+                .rev()
+                .find(|(_, c)| c.is_whitespace())
+                .map_or(0, |(index, c)| index + c.len_utf8());
+            query.truncate(word_start);
+        } else {
+            query.pop();
+        }
+        self.set_query(query);
+        true
+    }
+
     pub fn set_query(&mut self, query: String) {
         self.query = query;
         self.selected_index = 0;
@@ -1024,6 +1050,101 @@ mod tests {
         palette.query = "nt".to_string(); // Should match "New Tab", "Next Tab", etc.
         let filtered = palette.filtered_rows();
         assert!(!filtered.is_empty());
+    }
+
+    #[test]
+    fn backspace_deletes_one_unicode_character() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("café字".to_string());
+        assert!(palette.backspace_query(ModifiersState::empty()));
+        assert_eq!(palette.query, "café");
+        assert!(palette.backspace_query(ModifiersState::SHIFT));
+        assert_eq!(palette.query, "caf");
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_previous_word_and_trailing_whitespace() {
+        for (query, expected) in [
+            ("Equalize Splits", "Equalize "),
+            ("Equalize Splits   ", "Equalize "),
+            ("one  two", "one  "),
+            ("one\ttwo", "one\t"),
+            ("café\u{2003}日本語  ", "café\u{2003}"),
+            ("日本語", ""),
+            ("  word", "  "),
+            ("   ", ""),
+        ] {
+            let mut palette = CommandPalette::new();
+            palette.set_query(query.to_string());
+            assert!(palette.backspace_query(ModifiersState::CONTROL));
+            assert_eq!(palette.query, expected, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn ctrl_backspace_can_delete_words_repeatedly() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("one two three".to_string());
+        for expected in ["one two ", "one ", ""] {
+            assert!(palette.backspace_query(ModifiersState::CONTROL));
+            assert_eq!(palette.query, expected);
+        }
+        assert!(!palette.backspace_query(ModifiersState::CONTROL));
+    }
+
+    #[test]
+    fn command_backspace_clears_only_on_macos() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("Equalize Splits".to_string());
+        assert!(palette.backspace_query(ModifiersState::SUPER));
+        if cfg!(target_os = "macos") {
+            assert!(palette.query.is_empty());
+        } else {
+            assert_eq!(palette.query, "Equalize Split");
+        }
+
+        palette.set_query("Equalize Splits".to_string());
+        assert!(palette.backspace_query(ModifiersState::SUPER | ModifiersState::CONTROL));
+        if cfg!(target_os = "macos") {
+            assert!(palette.query.is_empty());
+        } else {
+            assert_eq!(palette.query, "Equalize ");
+        }
+    }
+
+    #[test]
+    fn backspace_resets_filter_selection_and_scroll_in_fonts_mode() {
+        let mut palette = CommandPalette::new();
+        palette.enter_fonts_mode(vec!["Fira Code".to_string()]);
+        palette.set_query("Fira Code".to_string());
+        palette.selected_index = 3;
+        palette.scroll_offset = 2;
+        palette.last_scroll_time = Some(Instant::now());
+        palette.caret_blink_start = Instant::now() - std::time::Duration::from_secs(1);
+        let previous_blink = palette.caret_blink_start;
+
+        assert!(palette.backspace_query(ModifiersState::CONTROL));
+        assert_eq!(palette.query, "Fira ");
+        assert_eq!(palette.selected_index, 0);
+        assert_eq!(palette.scroll_offset, 0);
+        assert!(palette.last_scroll_time.is_none());
+        assert!(palette.caret_blink_start > previous_blink);
+        assert!(matches!(palette.mode, PaletteMode::Fonts(_)));
+    }
+
+    #[test]
+    fn backspace_on_empty_query_is_a_noop() {
+        let mut palette = CommandPalette::new();
+        let blink = palette.caret_blink_start;
+        for modifiers in [
+            ModifiersState::empty(),
+            ModifiersState::CONTROL,
+            ModifiersState::SUPER,
+        ] {
+            assert!(!palette.backspace_query(modifiers));
+            assert!(palette.query.is_empty());
+            assert_eq!(palette.caret_blink_start, blink);
+        }
     }
 
     #[test]
