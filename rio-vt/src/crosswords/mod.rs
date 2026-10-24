@@ -655,6 +655,14 @@ impl<U: EventListener> Crosswords<U> {
         self.clear_screen(ClearMode::Saved);
     }
 
+    /// Clear both screen buffers and their history, restoring terminal modes,
+    /// saved cursors, graphics, and scroll regions to their reset state.
+    /// The frontend must also request a PTY redraw so an idle shell repaints
+    /// its prompt; resetting the emulator alone cannot produce shell output.
+    pub fn clear_history_and_reset(&mut self) {
+        self.reset_state();
+    }
+
     /// Scroll so the previous (`forward = false`) or next prompt row
     /// starts at the top of the viewport. Prompts come from OSC 133
     /// marks; a run of consecutive prompt rows counts as one prompt.
@@ -7440,6 +7448,118 @@ mod tests {
         assert_eq!(version_number("0.1.2-nightly"), 1_02);
         assert_eq!(version_number("1.2.3-nightly"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    #[test]
+    fn clear_history_and_reset_erases_scrollback_and_homes_cursors() {
+        use crate::performer::handler::Processor;
+        let mut term = new_term(8, 3);
+        Processor::default().advance(&mut term, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert!(term.history_size() > 0);
+        term.scroll_display(Scroll::Delta(1));
+        term.vi_mode_cursor.pos = Pos::new(Line(-1), Column(2));
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            term.vi_mode_cursor.pos,
+            Side::Left,
+        ));
+        term.reset_damage();
+
+        term.clear_history_and_reset();
+
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.display_offset(), 0);
+        assert_eq!(term.grid.cursor.pos, Pos::new(Line(0), Column(0)));
+        assert_eq!(term.vi_mode_cursor.pos, term.grid.cursor.pos);
+        assert!(!term.grid.cursor.should_wrap);
+        assert!(term.selection.is_none());
+        assert!(matches!(term.damage(), TermDamage::Full));
+        for row in 0..3 {
+            for col in 0..8 {
+                assert!(term.grid[Line(row)][Column(col)].is_empty());
+            }
+        }
+        term.input('x');
+        assert_eq!(term.grid[Line(0)][Column(0)].c(), 'x');
+    }
+
+    #[test]
+    fn clear_history_and_reset_restores_modes_and_saved_cursor() {
+        let mut term = new_term(4, 3);
+        let default_modes = (Mode::default() | Mode::GRAPHEME_CLUSTER).bits();
+        for ch in "abcd".chars() {
+            term.input(ch);
+        }
+        assert!(term.grid.cursor.should_wrap);
+        term.grid.saved_cursor = term.grid.cursor.clone();
+        term.scroll_region = Line(1)..Line(3);
+        term.mode
+            .insert(Mode::ORIGIN | Mode::APP_CURSOR | Mode::BRACKETED_PASTE);
+        term.mode.remove(Mode::SHOW_CURSOR);
+        term.reset_damage();
+
+        term.clear_history_and_reset();
+
+        assert_eq!(term.mode.bits(), default_modes);
+        assert_eq!(term.scroll_region, Line(0)..Line(3));
+        assert_eq!(term.grid.saved_cursor.pos, Pos::new(Line(0), Column(0)));
+        assert_eq!(term.grid.cursor.pos, Pos::new(Line(0), Column(0)));
+        assert!(!term.grid.cursor.should_wrap);
+        assert!(matches!(term.damage(), TermDamage::Full));
+        for row in 0..3 {
+            for col in 0..4 {
+                assert!(term.grid[Line(row)][Column(col)].is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn clear_history_and_reset_on_alt_clears_both_screens_and_graphics() {
+        use crate::performer::handler::Processor;
+        let mut term = new_term(8, 3);
+        let mut parser = Processor::default();
+        parser.advance(&mut term, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert!(term.history_size() > 0);
+        let place = |term: &mut Crosswords<VoidListener>, id| {
+            term.graphics
+                .store_kitty_image(id, None, kitty_test_image(id, 1, 1));
+            let mut request = virtual_request(id, 1);
+            request.virtual_placement = false;
+            request.cursor_movement = 1;
+            assert!(term.place_graphic(request));
+        };
+        place(&mut term, 1);
+        term.swap_alt();
+        parser.advance(&mut term, b"\x1b[Halt");
+        place(&mut term, 2);
+
+        term.clear_history_and_reset();
+
+        assert!(!term.mode.contains(Mode::ALT_SCREEN));
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.inactive_grid.history_size(), 0);
+        assert_eq!(term.grid.cursor.pos, Pos::new(Line(0), Column(0)));
+        for row in 0..3 {
+            for col in 0..8 {
+                assert!(term.grid[Line(row)][Column(col)].is_empty());
+                assert!(term.inactive_grid[Line(row)][Column(col)].is_empty());
+            }
+        }
+        assert!(term.graphics.kitty_placements.is_empty());
+        assert!(term.graphics.kitty_images.is_empty());
+        assert!(term.graphics.kitty_virtual_placements.is_empty());
+        assert!(term.graphics.atlas_placements.is_empty());
+        assert!(term
+            .graphics
+            .kitty_inactive_screen
+            .kitty_placements
+            .is_empty());
+        assert!(term.graphics.kitty_inactive_screen.kitty_images.is_empty());
+        assert!(term
+            .graphics
+            .kitty_inactive_screen
+            .atlas_placements
+            .is_empty());
     }
 
     #[test]

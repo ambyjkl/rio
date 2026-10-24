@@ -325,11 +325,39 @@ where
                 Msg::Resize(window_size) => {
                     let _ = self.pty.set_winsize(window_size.into());
                 }
+                Msg::Refresh(window_size) => {
+                    if let Err(err) = self.refresh_pty(window_size) {
+                        error!("could not request terminal redraw: {err}");
+                    }
+                }
                 Msg::Shutdown => return false,
             }
         }
 
         true
+    }
+
+    /// Like Konsole's refresh: change the PTY width briefly, then restore it.
+    /// A same-size resize may not notify the shell at all. This runs on the
+    /// PTY worker, not the UI thread, and never changes Rio's grid geometry.
+    fn refresh_pty(&mut self, size: crate::event::WindowSize) -> io::Result<()> {
+        let mut temporary = size;
+        // ConPTY uses signed 16-bit coordinates. Also avoid overflowing u16.
+        temporary.cols = if size.cols < i16::MAX as u16 {
+            size.cols + 1
+        } else {
+            size.cols - 1
+        };
+        temporary.width = size.width.saturating_add(1);
+        let resized = self.pty.set_winsize(temporary.into());
+        if resized.is_ok() {
+            // Give the child a chance to observe the first size before the
+            // second notification (the same short delay used by Konsole).
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+        // Always attempt restoration, even if the first resize reported failure.
+        let restored = self.pty.set_winsize(size.into());
+        resized.and(restored)
     }
 
     #[inline]
