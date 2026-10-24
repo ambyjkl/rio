@@ -279,6 +279,19 @@ fn single_title_x(
     (((window_width / scale_factor) - text_width) / 2.0).max(left_margin + TAB_PADDING_X)
 }
 
+fn single_title_contains_x(
+    window_width: f32,
+    scale_factor: f32,
+    text_width: f32,
+    left_margin: f32,
+    x: f32,
+) -> bool {
+    let start = single_title_x(window_width, scale_factor, text_width, left_margin);
+    text_width > 0.0
+        && x >= start - TAB_PADDING_X
+        && x < start + text_width + TAB_PADDING_X
+}
+
 #[inline]
 fn close_button_center(island_x: f32, island_w: f32) -> Option<f32> {
     (island_w >= CLOSE_MIN_ISLAND_WIDTH)
@@ -736,6 +749,37 @@ impl Island {
     #[inline]
     pub fn height(&self) -> f32 {
         ISLAND_HEIGHT
+    }
+
+    /// A lone tab is a centred title, not a slot at the left edge. Use
+    /// the same fitting and measurement as drawing to identify its hit area.
+    pub fn single_title_hit(
+        &self,
+        sugarloaf: &mut Sugarloaf,
+        context_manager: &ContextManager<EventProxy>,
+        x: f32,
+    ) -> bool {
+        let width = sugarloaf.window_size().width;
+        let scale = sugarloaf.scale_factor();
+        let layout = tab_strip_layout(width, scale, 1, self.max_tab_width);
+        let raw_title = self.get_title_for_tab(context_manager, 0);
+        if raw_title.is_empty() {
+            return false;
+        }
+        let bell_width = if context_manager.bell(0) {
+            BELL_DOT_SIZE + BELL_GAP
+        } else {
+            0.0
+        };
+        let budget =
+            (single_title_budget(width, scale, layout.left_margin) - bell_width).max(0.0);
+        let title = fit_title_to_width(sugarloaf, &raw_title, budget);
+        let opts = DrawOpts {
+            font_size: TITLE_FONT_SIZE,
+            ..DrawOpts::default()
+        };
+        let text_width = sugarloaf.text_mut().measure(&title, &opts) + bell_width;
+        single_title_contains_x(width, scale, text_width, layout.left_margin, x)
     }
 
     /// Render tabs using equal-width layout
@@ -1514,6 +1558,35 @@ mod tests {
 
         // At 1x the two agree, which is why this only showed up on retina.
         assert_eq!(single_title_x(800.0, 1.0, 100.0, 0.0), 350.0);
+    }
+
+    #[test]
+    fn single_title_hit_leaves_empty_space_on_both_sides() {
+        // 800 logical pixels, centred 100px title plus its normal padding.
+        for scale in [1.0, 2.0] {
+            assert!(!single_title_contains_x(
+                800.0 * scale,
+                scale,
+                100.0,
+                0.0,
+                100.0
+            ));
+            assert!(single_title_contains_x(
+                800.0 * scale,
+                scale,
+                100.0,
+                0.0,
+                400.0
+            ));
+            assert!(!single_title_contains_x(
+                800.0 * scale,
+                scale,
+                100.0,
+                0.0,
+                700.0
+            ));
+        }
+        assert!(!single_title_contains_x(800.0, 1.0, 0.0, 0.0, 400.0));
     }
 
     #[test]
