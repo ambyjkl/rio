@@ -3994,6 +3994,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wayland-client",
+ "wayland-protocols-wlr",
  "wgpu",
  "windows-sys 0.60.2",
  "winres",

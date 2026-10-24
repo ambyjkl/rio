@@ -168,6 +168,8 @@ pub struct Config {
     /// program's DECSET/DECRST still wins at runtime.
     #[serde(default = "default_bool_true", rename = "grapheme-clustering")]
     pub grapheme_clustering: bool,
+    /// Also copy completed mouse selections to CLIPBOARD. On X11 and Wayland,
+    /// PRIMARY is updated independently of this option when supported.
     #[serde(default = "bool::default", rename = "copy-on-select")]
     pub copy_on_select: bool,
     #[serde(

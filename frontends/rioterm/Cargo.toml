@@ -65,6 +65,10 @@ objc = { workspace = true }
 ashpd = { version = "0.13.13", features = ["global_shortcuts"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros", "sync"] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
 [build-dependencies]
 cfg_aliases = "0.2.1"
 
