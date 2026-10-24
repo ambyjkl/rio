@@ -1,5 +1,5 @@
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-mod fork_cwd_tests;
+mod cwd_tests;
 pub mod renderable;
 pub mod title;
 
@@ -1238,35 +1238,32 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.set_current(target);
     }
 
+    /// Inherit the root shell's current directory, not a foreground job's cwd.
+    /// A script can chdir without changing the shell it was launched from.
+    fn working_directory_for_new_context(&self) -> Option<String> {
+        if !self.config.cwd {
+            return self.config.working_dir.clone();
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            teletypewriter::process_working_directory(self.current().shell_pid)
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+                .or_else(|| self.config.working_dir.clone())
+        }
+
+        #[cfg(target_os = "windows")]
+        None
+    }
+
     pub fn split(
         &mut self,
         rich_text_id: usize,
         split_down: bool,
         sugarloaf: &mut Sugarloaf,
     ) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
-        }
-
+        let working_dir = self.working_directory_for_new_context();
         let mut cloned_config = self.config.clone();
         if working_dir.is_some() {
             cloned_config.working_dir = working_dir;
@@ -1366,28 +1363,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn add_context(&mut self, redirect: bool, rich_text_id: usize) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
-        }
+        let working_dir = self.working_directory_for_new_context();
 
         if self.config.is_native {
             self.event_proxy

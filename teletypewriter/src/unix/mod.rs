@@ -1021,6 +1021,13 @@ pub fn foreground_process_path(
         pid = shell_pid as libc::pid_t;
     }
 
+    process_working_directory(pid as u32)
+}
+
+/// Read a process's own working directory without following its foreground job.
+pub fn process_working_directory(
+    pid: u32,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     let link_path = format!("/proc/{pid}/cwd");
     #[cfg(target_os = "freebsd")]
@@ -1030,7 +1037,7 @@ pub fn foreground_process_path(
     let cwd = std::fs::read_link(link_path)?;
 
     #[cfg(target_os = "macos")]
-    let cwd = macos_cwd(pid)?;
+    let cwd = macos_cwd(pid as libc::pid_t)?;
 
     Ok(cwd)
 }
