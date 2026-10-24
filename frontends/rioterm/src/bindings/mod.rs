@@ -232,6 +232,10 @@ impl From<String> for Action {
                 Some(Action::Search(SearchAction::SearchHistoryPrevious))
             }
             "clearhistory" => Some(Action::ClearHistory),
+            // Keep the earlier spelling working in existing configurations.
+            "clearhistoryandreset" | "clearscreenandhistory" => {
+                Some(Action::ClearHistoryAndReset)
+            }
             "resetfontsize" => Some(Action::ResetFontSize),
             "increasefontsize" => Some(Action::IncreaseFontSize),
             "decreasefontsize" => Some(Action::DecreaseFontSize),
@@ -387,8 +391,11 @@ pub enum Action {
     /// Scroll all the way to the bottom.
     ScrollToBottom,
 
-    /// Clear the display buffer(s) to remove history.
+    /// Clear saved scrollback without erasing the visible screen.
     ClearHistory,
+
+    /// Clear the active pane's history, reset its terminal, and request a redraw.
+    ClearHistoryAndReset,
 
     /// Hide the Rio window.
     #[allow(dead_code)]
@@ -1345,6 +1352,37 @@ mod tests {
                 trigger: Default::default(),
             }
         }
+    }
+
+    #[test]
+    fn clear_history_and_reset_is_configurable() {
+        for action in [
+            "ClearHistoryAndReset",
+            "clearhistoryandreset",
+            "CLEARHISTORYANDRESET",
+            "ClearScreenAndHistory",
+        ] {
+            let bindings = config_key_bindings(
+                vec![ConfigKeyBinding {
+                    key: "k".into(),
+                    with: "control | shift".into(),
+                    action: action.into(),
+                    esc: String::new(),
+                    mode: String::new(),
+                }],
+                Vec::new(),
+            );
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].action, Action::ClearHistoryAndReset);
+            assert_eq!(
+                bindings[0].mods,
+                ModifiersState::CONTROL | ModifiersState::SHIFT
+            );
+        }
+        assert_eq!(
+            Action::from("ClearHistory".to_string()),
+            Action::ClearHistory
+        );
     }
 
     #[test]
