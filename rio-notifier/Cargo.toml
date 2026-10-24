@@ -15,13 +15,17 @@ objc2-foundation = { version = "0.2.2", features = ["NSString"] }
 objc2-user-notifications = { version = "0.2.2", features = [
     "UNUserNotificationCenter",
     "UNNotificationContent",
+    "UNNotification",
+    "UNNotificationResponse",
     "UNNotificationRequest",
     "UNNotificationTrigger",
     "block2",
 ] }
 
 [target.'cfg(all(not(target_os = "macos"), not(target_os = "windows")))'.dependencies]
-zbus = { version = "4", features = ["blocking"] }
+zbus = { workspace = true, features = ["blocking-api", "tokio"] }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 # Bumped from `0.58` to `0.62` so this doesn't pull a second copy of
@@ -31,5 +35,6 @@ zbus = { version = "4", features = ["blocking"] }
 # stable across both versions.
 windows = { version = "0.62", features = [
     "Data_Xml_Dom",
+    "Foundation",
     "UI_Notifications",
 ] }

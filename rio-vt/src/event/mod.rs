@@ -268,10 +268,17 @@ pub enum RioEvent {
     /// Terminal bell ring, from the PTY identified by `route_id`.
     Bell(usize),
 
-    /// Desktop notification from OSC 9 or OSC 777.
+    /// Desktop notification from OSC 9 or OSC 777, with its originating pane.
     DesktopNotification {
+        route_id: usize,
         title: String,
         body: String,
+    },
+
+    /// A notification was clicked; focus its originating window, tab and pane.
+    FocusWindowFromNotification {
+        route_id: usize,
+        activation_token: Option<String>,
     },
 
     /// Shutdown request.
@@ -362,8 +369,15 @@ impl Debug for RioEvent {
             }
             RioEvent::Scroll(scroll) => write!(f, "Scroll {scroll:?}"),
             RioEvent::Bell(route_id) => write!(f, "Bell route {route_id}"),
-            RioEvent::DesktopNotification { title, body } => {
-                write!(f, "DesktopNotification({title}, {body})")
+            RioEvent::DesktopNotification {
+                route_id,
+                title,
+                body,
+            } => {
+                write!(f, "DesktopNotification(route={route_id}, {title}, {body})")
+            }
+            RioEvent::FocusWindowFromNotification { .. } => {
+                write!(f, "FocusWindowFromNotification")
             }
             RioEvent::Exit => write!(f, "Exit"),
             RioEvent::Quit => write!(f, "Quit"),

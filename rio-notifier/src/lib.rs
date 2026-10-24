@@ -6,149 +6,59 @@ pub fn request_authorization() {
     platform::request_authorization();
 }
 
+type Activation = Box<dyn FnOnce(Option<String>) + Send + 'static>;
+
 /// Send a desktop notification using the platform's native API.
 ///
-/// - **macOS**: `UNUserNotificationCenter` (requires app bundle with identifier).
-/// - **Linux**: D-Bus `org.freedesktop.Notifications`.
-/// - **Windows**: Toast notifications via `windows` crate.
-///
-/// Spawns a background thread so the caller is never blocked.
+/// The caller is never blocked. Use [`send_notification_with_activation`] to
+/// associate a notification click with its originating terminal window.
 pub fn send_notification(title: &str, body: &str) {
-    let title = if title.is_empty() {
-        "Rio".to_string()
-    } else {
-        title.to_string()
-    };
-    let body = body.to_string();
+    send(title, body, None);
+}
 
-    std::thread::spawn(move || {
-        platform::notify(&title, &body);
-    });
+/// Send a desktop notification and handle its default (click) action once.
+///
+/// On Linux, the callback receives the compositor's activation token, when the
+/// notification server supplies one (notably on Wayland). Without a token,
+/// compositor focus-stealing prevention may refuse to focus the window. Servers
+/// which do not support actions cannot report clicks. On Windows and macOS the
+/// token is always `None`. macOS requires an app bundle and an available
+/// notification-center delegate; an existing foreign delegate is never replaced.
+///
+/// The callback may run off the UI thread and should return promptly, e.g. by
+/// sending an event to the UI thread. It is dropped without being called if the
+/// notification closes, delivery fails, or activation is unsupported. Linux and
+/// macOS use bounded workers: excess requests are dropped rather than creating
+/// unbounded threads. macOS also bounds retained callbacks; older notifications
+/// may remain visible without supporting activation.
+pub fn send_notification_with_activation(
+    title: &str,
+    body: &str,
+    on_activate: impl FnOnce(Option<String>) + Send + 'static,
+) {
+    send(title, body, Some(Box::new(on_activate)));
+}
+
+fn send(title: &str, body: &str, on_activate: Option<Activation>) {
+    let title = if title.is_empty() { "Rio" } else { title }.to_owned();
+    let body = body.to_owned();
+    platform::send(title, body, on_activate);
+}
+
+// User callbacks must not unwind through native event handlers or kill the
+// persistent notification worker.
+fn activate(callback: Activation, token: Option<String>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(token)));
 }
 
 #[cfg(target_os = "macos")]
-mod platform {
-    use block2::RcBlock;
-    use objc::runtime::Object;
-    use objc::{class, msg_send, sel, sel_impl};
-    use objc2::runtime::Bool;
-    use objc2_foundation::{NSError, NSString};
-    use objc2_user_notifications::{
-        UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
-        UNUserNotificationCenter,
-    };
-    use std::sync::Once;
-
-    pub(crate) fn request_authorization() {
-        static INIT: Once = Once::new();
-        INIT.call_once(|| unsafe {
-            let bundle: *mut Object = msg_send![class!(NSBundle), mainBundle];
-            if bundle.is_null() {
-                return;
-            }
-            let bundle_id: *mut Object = msg_send![bundle, bundleIdentifier];
-            if bundle_id.is_null() {
-                return;
-            }
-
-            let center = UNUserNotificationCenter::currentNotificationCenter();
-            center.requestAuthorizationWithOptions_completionHandler(
-                UNAuthorizationOptions::UNAuthorizationOptionAlert
-                    | UNAuthorizationOptions::UNAuthorizationOptionSound,
-                &RcBlock::new(|_ok: Bool, _err: *mut NSError| {}),
-            );
-        });
-    }
-
-    pub fn notify(title: &str, body: &str) {
-        unsafe {
-            // UNUserNotificationCenter crashes if the app has no bundle
-            // identifier (e.g. cargo run). Guard like Kitty does.
-            let bundle: *mut Object = msg_send![class!(NSBundle), mainBundle];
-            if bundle.is_null() {
-                return;
-            }
-            let bundle_id: *mut Object = msg_send![bundle, bundleIdentifier];
-            if bundle_id.is_null() {
-                return;
-            }
-
-            let center = UNUserNotificationCenter::currentNotificationCenter();
-
-            let content = UNMutableNotificationContent::new();
-            content.setTitle(&NSString::from_str(title));
-            content.setBody(&NSString::from_str(body));
-
-            let identifier = NSString::from_str("rio-notification");
-            let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
-                &identifier,
-                &content,
-                None,
-            );
-
-            center.addNotificationRequest_withCompletionHandler(&request, None);
-        }
-    }
-}
+#[path = "macos.rs"]
+mod platform;
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-mod platform {
-    use std::collections::HashMap;
-
-    pub fn notify(title: &str, body: &str) {
-        let Ok(connection) = zbus::blocking::Connection::session() else {
-            return;
-        };
-        let Ok(proxy) = zbus::blocking::Proxy::new(
-            &connection,
-            "org.freedesktop.Notifications",
-            "/org/freedesktop/Notifications",
-            "org.freedesktop.Notifications",
-        ) else {
-            return;
-        };
-        let hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-        let _: Result<u32, _> = proxy.call(
-            "Notify",
-            &(
-                "Rio",          // app_name
-                0u32,           // replaces_id
-                "rio",          // app_icon
-                title,          // summary
-                body,           // body
-                &[] as &[&str], // actions
-                &hints,         // hints
-                -1i32,          // expire_timeout
-            ),
-        );
-    }
-}
+#[path = "linux.rs"]
+mod platform;
 
 #[cfg(target_os = "windows")]
-mod platform {
-    pub fn notify(title: &str, body: &str) {
-        use windows::core::HSTRING;
-        use windows::Data::Xml::Dom::XmlDocument;
-        use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
-
-        let Ok(xml) = XmlDocument::new() else {
-            return;
-        };
-        let toast_xml = format!(
-            r#"<toast><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text></binding></visual></toast>"#,
-            title, body,
-        );
-        if xml.LoadXml(&HSTRING::from(&toast_xml)).is_err() {
-            return;
-        }
-        let Ok(toast) = ToastNotification::CreateToastNotification(&xml) else {
-            return;
-        };
-        let Ok(notifier) =
-            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from("Rio"))
-        else {
-            return;
-        };
-        let _ = notifier.Show(&toast);
-    }
-}
+#[path = "windows.rs"]
+mod platform;

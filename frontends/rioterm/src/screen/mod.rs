@@ -383,6 +383,28 @@ impl Screen<'_> {
         &mut self.context_manager
     }
 
+    /// Focus a notification's originating tab and split without affecting a
+    /// different terminal when the original pane has already been closed.
+    pub fn focus_terminal(&mut self, route_id: usize, clipboard: &mut Clipboard) -> bool {
+        if self.context_manager.get_by_route_id(route_id).is_none() {
+            return false;
+        }
+        // Search belongs to the previously focused pane; cancel it before
+        // changing contexts so its selection/viewport is restored there.
+        if self.search_active() {
+            self.cancel_search(clipboard);
+        }
+        let old_index = self.context_manager.current_index();
+        self.context_manager.select_route(route_id);
+        self.context_manager.switch_context_visibility(
+            &mut self.sugarloaf,
+            old_index,
+            self.context_manager.current_index(),
+        );
+        self.mark_dirty();
+        true
+    }
+
     #[inline]
     pub fn mark_dirty(&mut self) {
         self.context_manager

@@ -4294,7 +4294,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
     #[inline]
     fn desktop_notification(&mut self, title: String, body: String) {
         self.event_proxy.send_event(
-            RioEvent::DesktopNotification { title, body },
+            RioEvent::DesktopNotification {
+                route_id: self.route_id,
+                title,
+                body,
+            },
             self.window_id,
         );
     }
@@ -6239,6 +6243,55 @@ mod tests {
         assert_eq!(cw.display_offset(), 3);
         cw.scroll_to_prompt(false);
         assert_eq!(cw.display_offset(), 3);
+    }
+
+    #[test]
+    fn desktop_notification_oscs_preserve_the_originating_pane() {
+        use crate::performer::handler::Processor;
+        use std::{cell::RefCell, rc::Rc};
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        for route_id in [7, 42] {
+            let mut terminal = Crosswords::new(
+                CrosswordsSize::new(40, 5),
+                CursorShape::Block,
+                TestListener {
+                    events: events.clone(),
+                },
+                WindowId::from(0),
+                route_id,
+                10,
+            );
+            Processor::default().advance(
+                &mut terminal,
+                b"\x1b]9;first notification\x07\x1b]777;notify;build;done\x07",
+            );
+        }
+        let notifications: Vec<_> = events
+            .borrow()
+            .iter()
+            .filter_map(|event| {
+                if let RioEvent::DesktopNotification {
+                    route_id,
+                    title,
+                    body,
+                } = event
+                {
+                    Some((*route_id, title.clone(), body.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            notifications,
+            vec![
+                (7, String::new(), "first notification".into()),
+                (7, "build".into(), "done".into()),
+                (42, String::new(), "first notification".into()),
+                (42, "build".into(), "done".into()),
+            ]
+        );
     }
 
     #[test]
