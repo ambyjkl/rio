@@ -28,6 +28,14 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+fn current_index_after_tab_close(current: usize, closed: usize) -> usize {
+    if closed <= current {
+        current.saturating_sub(1)
+    } else {
+        current
+    }
+}
+
 // Global atomic counter for generating unique route IDs
 static ROUTE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
@@ -1111,7 +1119,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn close_current_context(&mut self, sugarloaf: &mut Sugarloaf) {
+    pub fn close_context_at_index(&mut self, index: usize, sugarloaf: &mut Sugarloaf) {
+        if index >= self.contexts.len() {
+            return;
+        }
         if self.contexts.len() == 1 {
             // MacOS: Close last tab will work, leading to hide and
             // keep Rio running in background.
@@ -1123,21 +1134,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return;
         }
 
-        let index_to_remove = self.current_index;
-        let mut should_set_current = false;
-        if index_to_remove > 1 {
-            self.set_current(self.current_index - 1);
-        } else {
-            should_set_current = true;
-        }
-
-        // Remove all rich text from the grid before removing the context
-        self.contexts[index_to_remove].remove_from_sugarloaf(sugarloaf);
-        self.contexts.remove(index_to_remove);
-
-        if should_set_current {
-            self.set_current(0);
-        }
+        let current_index = current_index_after_tab_close(self.current_index, index);
+        // Remove the clicked tab without first focusing it. Closing a background
+        // tab must preserve the active terminal, including its selected split.
+        self.contexts[index].remove_from_sugarloaf(sugarloaf);
+        self.contexts.remove(index);
+        self.set_current(current_index);
 
         self.keep_only_active_context_visible(sugarloaf);
     }
@@ -1484,6 +1486,15 @@ pub fn process_open_url(
 pub mod test {
     use super::*;
     use crate::event::VoidListener;
+
+    #[test]
+    fn closing_background_tabs_preserves_the_active_tab() {
+        assert_eq!(current_index_after_tab_close(2, 0), 1);
+        assert_eq!(current_index_after_tab_close(1, 2), 1);
+        assert_eq!(current_index_after_tab_close(0, 2), 0);
+        assert_eq!(current_index_after_tab_close(2, 2), 1);
+        assert_eq!(current_index_after_tab_close(0, 0), 0);
+    }
 
     #[test]
     fn test_capacity() {
