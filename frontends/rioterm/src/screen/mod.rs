@@ -7,6 +7,7 @@
 // which is licensed under Apache 2.0 license.
 
 pub mod hint;
+mod tabs;
 pub mod touch;
 
 use crate::bindings::kitty_keyboard::build_key_sequence;
@@ -102,12 +103,15 @@ pub struct Screen<'screen> {
     #[cfg(target_os = "macos")]
     pub allow_manual_dragging: bool,
     last_chrome_press: Option<ChromePress>,
+    tab_bar_scroll: tabs::TabBarScroll,
+    middle_tab_press: bool,
     last_close_press: Option<(std::time::Instant, f32)>,
     pub grids: rustc_hash::FxHashMap<usize, rio_backend::sugarloaf::grid::GridRenderer>,
     pub grid_rasterizer: rio_grid::GridGlyphRasterizer,
 }
 
 pub struct ChromePress {
+    empty_tab_bar: bool,
     window_origin: Option<rio_window::dpi::PhysicalPosition<i32>>,
     at: std::time::Instant,
 }
@@ -116,8 +120,10 @@ impl ChromePress {
     fn validates_double_click(
         &self,
         window_origin: Option<rio_window::dpi::PhysicalPosition<i32>>,
+        empty_tab_bar: bool,
     ) -> bool {
-        self.at.elapsed() <= crate::constants::MULTI_CLICK_THRESHOLD
+        self.empty_tab_bar == empty_tab_bar
+            && self.at.elapsed() <= crate::constants::MULTI_CLICK_THRESHOLD
             && self.window_origin == window_origin
     }
 }
@@ -352,6 +358,8 @@ impl Screen<'_> {
             #[cfg(target_os = "macos")]
             allow_manual_dragging: config.navigation.is_enabled(),
             last_chrome_press: None,
+            tab_bar_scroll: tabs::TabBarScroll::default(),
+            middle_tab_press: false,
             last_close_press: None,
             grids: rustc_hash::FxHashMap::default(),
             grid_rasterizer: rio_grid::GridGlyphRasterizer::new(),
@@ -1783,14 +1791,22 @@ impl Screen<'_> {
     }
 
     pub fn close_tab(&mut self, clipboard: &mut Clipboard) {
-        self.clear_selection();
+        self.close_tab_at_index(self.context_manager.current_index(), clipboard);
+    }
+
+    fn close_tab_at_index(&mut self, index: usize, clipboard: &mut Clipboard) {
+        if index == self.context_manager.current_index() {
+            self.stop_hint_mode_if_active();
+            self.cancel_search(clipboard);
+            self.clear_selection();
+        }
         self.context_manager
-            .close_current_context(&mut self.sugarloaf);
+            .close_context_at_index(index, &mut self.sugarloaf);
         if let Some(ref mut island) = self.renderer.island {
             island.dismiss_color_picker();
+            island.cancel_drag();
         }
 
-        self.cancel_search(clipboard);
         if self.ctx().len() <= 1 {
             // Update the remaining tab's margin and position
             // (on Linux/Windows when hide_if_single transitions to hidden)
@@ -1800,8 +1816,8 @@ impl Screen<'_> {
                 self.context_manager
                     .current_grid_mut()
                     .update_dimensions(&mut self.sugarloaf);
-                self.mark_dirty();
             }
+            self.mark_dirty();
             return;
         }
         let num_tabs = self.ctx().len();
@@ -2882,17 +2898,25 @@ impl Screen<'_> {
         &mut self,
         window: &rio_window::window::Window,
         prev: Option<ChromePress>,
+        empty_tab_bar: bool,
+        clipboard: &mut Clipboard,
     ) {
         let window_origin = window.outer_position().ok();
         let double = matches!(self.mouse.click_state, ClickState::DoubleClick)
-            && prev.is_some_and(|p| p.validates_double_click(window_origin));
+            && prev
+                .is_some_and(|p| p.validates_double_click(window_origin, empty_tab_bar));
         if double {
-            let is_maximized = window.is_maximized();
-            window.set_maximized(!is_maximized);
+            if empty_tab_bar {
+                self.create_tab(clipboard);
+            } else {
+                let is_maximized = window.is_maximized();
+                window.set_maximized(!is_maximized);
+            }
             return;
         }
 
         self.last_chrome_press = Some(ChromePress {
+            empty_tab_bar,
             window_origin,
             at: std::time::Instant::now(),
         });
@@ -3022,7 +3046,7 @@ impl Screen<'_> {
                 // fall through would act on the first terminal row
                 // while the pointer is over window chrome.
                 if !is_right_click {
-                    self.on_chrome_press(window, chrome_press);
+                    self.on_chrome_press(window, chrome_press, false, clipboard);
                 }
                 return true;
             }
@@ -3044,14 +3068,25 @@ impl Screen<'_> {
             return true;
         }
 
-        // A lone tab is drawn as a title centred across the strip rather than
-        // an island in the first slot, so the whole strip belongs to it and a
-        // right-click anywhere on it should reach that tab. The left margin
-        // (traffic lights on macOS) stays outside either way.
+        // A lone tab is a centred title, not a slot at the left edge. Blank
+        // space on either side can create a tab; right-click (or Control-click)
+        // still opens that lone tab's picker anywhere on the strip. The macOS
+        // traffic-light margin remains window chrome.
         let past_last_tab = num_tabs > 1 && x_in_tabs >= layout.tabs_width;
-        if x_in_tabs < 0.0 || past_last_tab {
+        let beside_single_title = !is_right_click
+            && !self.modifiers.state().control_key()
+            && num_tabs == 1
+            && self.renderer.island.as_ref().is_some_and(|island| {
+                !island.single_title_hit(
+                    &mut self.sugarloaf,
+                    &self.context_manager,
+                    mouse_x_unscaled,
+                )
+            });
+        if x_in_tabs < 0.0 || past_last_tab || beside_single_title {
             if !is_right_click {
-                self.on_chrome_press(window, chrome_press);
+                let empty_tab_bar = x_in_tabs >= 0.0;
+                self.on_chrome_press(window, chrome_press, empty_tab_bar, clipboard);
             }
             return true;
         }
@@ -3084,7 +3119,7 @@ impl Screen<'_> {
         }
 
         if num_tabs == 1 {
-            self.on_chrome_press(window, chrome_press);
+            self.on_chrome_press(window, chrome_press, false, clipboard);
             return true;
         }
 
@@ -3135,6 +3170,85 @@ impl Screen<'_> {
             }
         }
 
+        true
+    }
+
+    fn pointer_on_tab_bar(&self) -> bool {
+        let scale = self.sugarloaf.scale_factor();
+        self.renderer
+            .navigation
+            .island_visible(self.context_manager.len())
+            && self.mouse.y >= 0.0
+            && self.mouse.y <= f64::from(ISLAND_HEIGHT * scale)
+            && self.mouse.x >= 0.0
+            && self.mouse.x < f64::from(self.sugarloaf.window_size().width)
+    }
+
+    pub fn take_middle_tab_press(&mut self) -> bool {
+        std::mem::take(&mut self.middle_tab_press)
+    }
+
+    pub fn handle_tab_bar_middle_click(&mut self, clipboard: &mut Clipboard) -> bool {
+        if !self.pointer_on_tab_bar() {
+            return false;
+        }
+        // Latch even blank-space presses: their releases must never be sent
+        // to a terminal, including after closing a tab hides the whole strip.
+        self.middle_tab_press = true;
+        let count = self.context_manager.len();
+        let x = self.mouse.x as f32 / self.sugarloaf.scale_factor();
+        let layout = self.island_tab_layout(count);
+        let clicked = if count == 1 {
+            self.renderer.island.as_ref().and_then(|island| {
+                (x >= layout.left_margin
+                    && island.single_title_hit(
+                        &mut self.sugarloaf,
+                        &self.context_manager,
+                        x,
+                    ))
+                .then_some(0)
+            })
+        } else {
+            tabs::tab_index_at_x(&layout, count, x)
+        };
+        if let Some(index) = clicked {
+            self.close_tab_at_index(index, clipboard);
+        }
+        true
+    }
+
+    pub fn handle_tab_bar_scroll(
+        &mut self,
+        delta: rio_window::event::MouseScrollDelta,
+        phase: rio_window::event::TouchPhase,
+        clipboard: &mut Clipboard,
+    ) -> bool {
+        let count = self.context_manager.len();
+        let scale = self.sugarloaf.scale_factor();
+        if !self.pointer_on_tab_bar() {
+            self.tab_bar_scroll = tabs::TabBarScroll::default();
+            return false;
+        }
+
+        let steps = self.tab_bar_scroll.steps(delta, phase, f64::from(scale));
+        let old_index = self.context_manager.current_index();
+        let new_index = tabs::tab_index_after_scroll(old_index, count, steps);
+        if old_index != new_index {
+            self.stop_hint_mode_if_active();
+            self.cancel_search(clipboard);
+            self.clear_selection();
+            if let Some(island) = self.renderer.island.as_mut() {
+                island.close_color_picker(&mut self.context_manager);
+                island.cancel_drag();
+            }
+            self.context_manager.set_current(new_index);
+            self.context_manager.switch_context_visibility(
+                &mut self.sugarloaf,
+                old_index,
+                new_index,
+            );
+            self.mark_dirty();
+        }
         true
     }
 
@@ -5272,30 +5386,43 @@ mod tests {
 
         // Same origin, fresh → a chrome double-click.
         let fresh = ChromePress {
+            empty_tab_bar: false,
             window_origin: origin,
             at: std::time::Instant::now(),
         };
-        assert!(fresh.validates_double_click(origin));
+        assert!(fresh.validates_double_click(origin, false));
+        assert!(!fresh.validates_double_click(origin, true));
 
         // Window moved between the presses (a re-grab after a window
         // drag) → keep dragging, don't maximize.
-        assert!(!fresh.validates_double_click(Some(PhysicalPosition::new(110, 20))));
+        assert!(
+            !fresh.validates_double_click(Some(PhysicalPosition::new(110, 20)), false)
+        );
+
+        let empty = ChromePress {
+            empty_tab_bar: true,
+            ..fresh
+        };
+        assert!(empty.validates_double_click(origin, true));
+        assert!(!empty.validates_double_click(origin, false));
 
         // Unreported origin on both presses (Wayland) → time guard
         // alone decides; a reported-vs-unreported mix never validates.
         let unknown = ChromePress {
+            empty_tab_bar: false,
             window_origin: None,
             at: std::time::Instant::now(),
         };
-        assert!(unknown.validates_double_click(None));
-        assert!(!unknown.validates_double_click(origin));
+        assert!(unknown.validates_double_click(None, false));
+        assert!(!unknown.validates_double_click(origin, false));
 
         // Stale press → expired even at the same origin.
         let stale = ChromePress {
+            empty_tab_bar: false,
             window_origin: origin,
             at: std::time::Instant::now() - crate::constants::MULTI_CLICK_THRESHOLD * 2,
         };
-        assert!(!stale.validates_double_click(origin));
+        assert!(!stale.validates_double_click(origin, false));
     }
 
     #[test]

@@ -1332,6 +1332,13 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     _ => (),
                 }
 
+                if button == MouseButton::Middle {
+                    let was_tab_press = route.window.screen.take_middle_tab_press();
+                    if state == ElementState::Released && was_tab_press {
+                        return;
+                    }
+                }
+
                 match state {
                     ElementState::Pressed => {
                         // Calculate time since the last click to handle double/triple clicks.
@@ -1458,6 +1465,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                 route.request_redraw();
                                 return;
                             }
+                        }
+
+                        if button == MouseButton::Middle
+                            && route
+                                .window
+                                .screen
+                                .handle_tab_bar_middle_click(&mut self.router.clipboard)
+                        {
+                            route.request_redraw();
+                            return;
                         }
 
                         // Always try panel switching first: if the click
@@ -1984,6 +2001,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                 if self.config.hide_cursor_when_typing {
                     route.window.winit_window.set_cursor_visible(true);
+                }
+
+                // Tab-bar gestures must be consumed before terminal/split
+                // scrolling so they never reach an application underneath.
+                if route.window.screen.handle_tab_bar_scroll(
+                    delta,
+                    phase,
+                    &mut self.router.clipboard,
+                ) {
+                    route.request_redraw();
+                    return;
                 }
 
                 // Wheel input follows the pointer, independently of keyboard
