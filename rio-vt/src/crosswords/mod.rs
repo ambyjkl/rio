@@ -698,6 +698,66 @@ impl<U: EventListener> Crosswords<U> {
         self.clear_screen(ClearMode::Saved);
     }
 
+    /// Clear both screen buffers and their history, restoring terminal modes,
+    /// saved cursors, graphics, and scroll regions to their reset state.
+    /// The frontend must also request a PTY redraw so an idle shell repaints
+    /// its prompt; resetting the emulator alone cannot produce shell output.
+    pub fn clear_history_and_reset(&mut self) {
+        self.reset_terminal(true);
+    }
+
+    /// Full terminal reset (RIS). With `keep_prompt` the main screen keeps
+    /// its cursor line and column, and the title is left alone, as in
+    /// Konsole's "Clear History and Reset".
+    fn reset_terminal(&mut self, keep_prompt: bool) {
+        if self.mode.contains(Mode::ALT_SCREEN) {
+            std::mem::swap(&mut self.grid, &mut self.inactive_grid);
+        }
+        self.active_charset = Default::default();
+        self.cursor_shape = self.default_cursor_shape;
+        if keep_prompt {
+            self.grid.reset_keeping_prompt();
+        } else {
+            self.grid.reset();
+        }
+        self.inactive_grid.reset();
+        self.scroll_region = Line(0)..Line(self.grid.screen_lines() as i32);
+        self.tabs = TabStops::new(self.grid.columns());
+        self.title_stack = Vec::new();
+        self.modify_other_keys = 0;
+        self.keyboard_mode_stack = [0; KEYBOARD_MODE_STACK_MAX_DEPTH];
+        self.inactive_keyboard_mode_stack = [0; KEYBOARD_MODE_STACK_MAX_DEPTH];
+        self.keyboard_mode_idx = 0;
+        self.inactive_keyboard_mode_idx = 0;
+        if !keep_prompt && !self.title.is_empty() {
+            self.title = String::from("");
+            self.event_proxy.send_event(
+                RioEvent::Title(self.route_id, String::new()),
+                self.window_id,
+            );
+        }
+        self.selection = None;
+        self.vi_mode_cursor = ViModeCursor::new(self.grid.cursor.pos);
+        self.keyboard_mode_stack = Default::default();
+        self.inactive_keyboard_mode_stack = Default::default();
+
+        // Clear all graphics on full reset (both screens, kitty and
+        // sixel/iTerm2) and dispatch the queued texture removals.
+        self.graphics.clear_all_kitty_state();
+        self.send_graphics_updates();
+
+        // Preserve vi mode across resets.
+        self.mode &= Mode::VI;
+        self.sync_update_started = None;
+        self.mode.insert(Mode::default());
+        self.mode
+            .set(Mode::GRAPHEME_CLUSTER, self.grapheme_clustering_default);
+
+        self.event_proxy
+            .send_event(RioEvent::CursorBlinkingChange, self.window_id);
+        self.mark_fully_damaged();
+    }
+
     /// Scroll so the previous (`forward = false`) or next prompt row
     /// starts at the top of the viewport. Prompts come from OSC 133
     /// marks; a run of consecutive prompt rows counts as one prompt.
@@ -3388,48 +3448,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn reset_state(&mut self) {
-        if self.mode.contains(Mode::ALT_SCREEN) {
-            std::mem::swap(&mut self.grid, &mut self.inactive_grid);
-        }
-        self.active_charset = Default::default();
-        self.cursor_shape = self.default_cursor_shape;
-        self.grid.reset();
-        self.inactive_grid.reset();
-        self.scroll_region = Line(0)..Line(self.grid.screen_lines() as i32);
-        self.tabs = TabStops::new(self.grid.columns());
-        self.title_stack = Vec::new();
-        self.modify_other_keys = 0;
-        self.keyboard_mode_stack = [0; KEYBOARD_MODE_STACK_MAX_DEPTH];
-        self.inactive_keyboard_mode_stack = [0; KEYBOARD_MODE_STACK_MAX_DEPTH];
-        self.keyboard_mode_idx = 0;
-        self.inactive_keyboard_mode_idx = 0;
-        if !self.title.is_empty() {
-            self.title = String::from("");
-            self.event_proxy.send_event(
-                RioEvent::Title(self.route_id, String::new()),
-                self.window_id,
-            );
-        }
-        self.selection = None;
-        self.vi_mode_cursor = Default::default();
-        self.keyboard_mode_stack = Default::default();
-        self.inactive_keyboard_mode_stack = Default::default();
-
-        // Clear all graphics on full reset (both screens, kitty and
-        // sixel/iTerm2) and dispatch the queued texture removals.
-        self.graphics.clear_all_kitty_state();
-        self.send_graphics_updates();
-
-        // Preserve vi mode across resets.
-        self.mode &= Mode::VI;
-        self.sync_update_started = None;
-        self.mode.insert(Mode::default());
-        self.mode
-            .set(Mode::GRAPHEME_CLUSTER, self.grapheme_clustering_default);
-
-        self.event_proxy
-            .send_event(RioEvent::CursorBlinkingChange, self.window_id);
-        self.mark_fully_damaged();
+        self.reset_terminal(false);
     }
 
     #[inline]
@@ -7588,6 +7607,155 @@ mod tests {
         assert_eq!(version_number("0.1.2-nightly"), 1_02);
         assert_eq!(version_number("1.2.3-nightly"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    #[test]
+    fn clear_history_and_reset_erases_scrollback_and_keeps_prompt_line() {
+        use crate::performer::handler::Processor;
+        let mut term = new_term(8, 3);
+        Processor::default().advance(&mut term, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert!(term.history_size() > 0);
+        term.scroll_display(Scroll::Delta(1));
+        term.vi_mode_cursor.pos = Pos::new(Line(-1), Column(2));
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            term.vi_mode_cursor.pos,
+            Side::Left,
+        ));
+        term.reset_damage();
+
+        term.clear_history_and_reset();
+
+        // Like Konsole: the cursor line moves to the top, keeping its
+        // column, so an idle prompt survives even if it is never redrawn.
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.display_offset(), 0);
+        assert_eq!(term.grid.cursor.pos, Pos::new(Line(0), Column(4)));
+        assert_eq!(term.vi_mode_cursor.pos, term.grid.cursor.pos);
+        assert!(!term.grid.cursor.should_wrap);
+        assert!(term.selection.is_none());
+        assert!(matches!(term.damage(), TermDamage::Full));
+        let row0: String = (0..8).map(|c| term.grid[Line(0)][Column(c)].c()).collect();
+        assert_eq!(row0.trim_end_matches('\0'), "five");
+        for row in 1..3 {
+            for col in 0..8 {
+                assert!(term.grid[Line(row)][Column(col)].is_empty());
+            }
+        }
+        term.input('x');
+        assert_eq!(term.grid[Line(0)][Column(4)].c(), 'x');
+    }
+
+    #[test]
+    fn clear_history_and_reset_moves_rows_below_the_cursor_up() {
+        use crate::performer::handler::Processor;
+        let mut term = new_term(8, 4);
+        Processor::default().advance(&mut term, b"aa\r\nbb\r\ncc\r\ndd\x1b[2;2H");
+        term.clear_history_and_reset();
+        let rows: Vec<String> = (0..4)
+            .map(|r| {
+                (0..8)
+                    .map(|c| term.grid[Line(r)][Column(c)].c())
+                    .collect::<String>()
+                    .trim_end_matches('\0')
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(rows, ["bb", "cc", "dd", ""]);
+        assert_eq!(term.grid.cursor.pos, Pos::new(Line(0), Column(1)));
+    }
+
+    #[test]
+    fn clear_history_and_reset_keeps_the_title() {
+        let mut term = new_term(8, 3);
+        term.title = "shell".to_string();
+        term.clear_history_and_reset();
+        assert_eq!(term.title, "shell");
+    }
+
+    #[test]
+    fn clear_history_and_reset_restores_modes_and_saved_cursor() {
+        let mut term = new_term(4, 3);
+        let default_modes = (Mode::default() | Mode::GRAPHEME_CLUSTER).bits();
+        for ch in "abcd".chars() {
+            term.input(ch);
+        }
+        assert!(term.grid.cursor.should_wrap);
+        term.grid.saved_cursor = term.grid.cursor.clone();
+        term.scroll_region = Line(1)..Line(3);
+        term.mode
+            .insert(Mode::ORIGIN | Mode::APP_CURSOR | Mode::BRACKETED_PASTE);
+        term.mode.remove(Mode::SHOW_CURSOR);
+        term.reset_damage();
+
+        term.clear_history_and_reset();
+
+        assert_eq!(term.mode.bits(), default_modes);
+        assert_eq!(term.scroll_region, Line(0)..Line(3));
+        assert_eq!(term.grid.saved_cursor.pos, Pos::new(Line(0), Column(0)));
+        // The prompt line (row 0 here) and the cursor column are kept.
+        assert_eq!(term.grid.cursor.pos, Pos::new(Line(0), Column(3)));
+        assert!(!term.grid.cursor.should_wrap);
+        assert!(matches!(term.damage(), TermDamage::Full));
+        assert_eq!(term.grid[Line(0)][Column(0)].c(), 'a');
+        for row in 1..3 {
+            for col in 0..4 {
+                assert!(term.grid[Line(row)][Column(col)].is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn clear_history_and_reset_on_alt_clears_both_screens_and_graphics() {
+        use crate::performer::handler::Processor;
+        let mut term = new_term(8, 3);
+        let mut parser = Processor::default();
+        parser.advance(&mut term, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert!(term.history_size() > 0);
+        let place = |term: &mut Crosswords<VoidListener>, id| {
+            term.graphics
+                .store_kitty_image(id, None, kitty_test_image(id, 1, 1));
+            let mut request = virtual_request(id, 1);
+            request.virtual_placement = false;
+            request.cursor_movement = 1;
+            assert!(term.place_graphic(request));
+        };
+        place(&mut term, 1);
+        term.swap_alt();
+        parser.advance(&mut term, b"\x1b[Halt");
+        place(&mut term, 2);
+
+        term.clear_history_and_reset();
+
+        assert!(!term.mode.contains(Mode::ALT_SCREEN));
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.inactive_grid.history_size(), 0);
+        // Back on the main screen with its prompt line moved to the top.
+        assert_eq!(term.grid.cursor.pos, Pos::new(Line(0), Column(4)));
+        assert_eq!(term.grid[Line(0)][Column(0)].c(), 'f');
+        for row in 0..3 {
+            for col in 0..8 {
+                if row > 0 {
+                    assert!(term.grid[Line(row)][Column(col)].is_empty());
+                }
+                assert!(term.inactive_grid[Line(row)][Column(col)].is_empty());
+            }
+        }
+        assert!(term.graphics.kitty_placements.is_empty());
+        assert!(term.graphics.kitty_images.is_empty());
+        assert!(term.graphics.kitty_virtual_placements.is_empty());
+        assert!(term.graphics.atlas_placements.is_empty());
+        assert!(term
+            .graphics
+            .kitty_inactive_screen
+            .kitty_placements
+            .is_empty());
+        assert!(term.graphics.kitty_inactive_screen.kitty_images.is_empty());
+        assert!(term
+            .graphics
+            .kitty_inactive_screen
+            .atlas_placements
+            .is_empty());
     }
 
     #[test]

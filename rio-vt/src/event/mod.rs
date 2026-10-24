@@ -92,6 +92,9 @@ pub enum Msg {
     Shutdown,
 
     Resize(WindowSize),
+
+    /// Ask the foreground program to redraw without injecting keyboard input.
+    Refresh(WindowSize),
 }
 
 #[derive(Debug, Eq, PartialEq)]

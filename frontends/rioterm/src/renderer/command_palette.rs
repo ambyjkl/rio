@@ -98,6 +98,7 @@ pub enum PaletteAction {
     SearchForward,
     SearchBackward,
     ClearHistory,
+    ClearHistoryAndReset,
     CloseCurrentSplitOrTab,
     /// Browse the family names of every registered font. Does NOT
     /// execute a one-shot action — the palette stays open with the
@@ -258,6 +259,11 @@ const COMMANDS: &[Command] = &[
         title: "Clear History",
         shortcut: "",
         action: PaletteAction::ClearHistory,
+    },
+    Command {
+        title: "Clear History and Reset",
+        shortcut: "",
+        action: PaletteAction::ClearHistoryAndReset,
     },
     Command {
         title: "List Fonts",
@@ -1042,6 +1048,16 @@ mod tests {
             palette.set_query(query.to_string());
             assert_eq!(palette.get_selected_action(), Some(expected));
         }
+    }
+
+    #[test]
+    fn clear_history_and_reset_is_actionable() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("Clear History and Reset".to_string());
+        assert_eq!(
+            palette.get_selected_action(),
+            Some(PaletteAction::ClearHistoryAndReset)
+        );
     }
 
     #[test]

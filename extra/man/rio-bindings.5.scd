@@ -207,6 +207,11 @@ action = "Quit"
 key = "Enter"
 with = "ctrl|shift"
 action = "CreateWindow"
+
+[[bindings.keys]]
+key = "k"
+with = "control | shift"
+action = "ClearHistoryAndReset"
 ```
 
 # AVAILABLE ACTIONS
@@ -276,6 +281,19 @@ action = "CreateWindow"
 
 *ScrollToBottom*
 	Scroll to bottom of buffer.
+
+*ClearHistory*
+	Clear the active pane's scrollback, leaving the visible screen intact.
+
+*ClearHistoryAndReset*
+	Clear both main and alternate screen buffers and their scrollback in the
+	active pane, reset terminal modes and cursors, and ask the foreground
+	program to redraw. As in Konsole, the line holding the cursor moves to
+	the top of the screen and keeps its column, so the prompt stays visible
+	while an idle interactive shell repaints it and its pending command line
+	without receiving Enter or any other input.
+	Other panes are unaffected. Also available in the command palette.
+	No default binding. The earlier ClearScreenAndHistory name remains an alias.
 
 *ToggleViMode*
 	Toggle Vi mode.

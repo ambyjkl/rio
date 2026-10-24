@@ -491,6 +491,30 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
             self.raw[line].reset(&self.cursor.template);
         }
     }
+
+    /// Reset like [`Grid::reset`], but keep the cursor's column and move the
+    /// cursor's line, plus everything below it, to the top of the screen.
+    /// Everything above that line is discarded together with the history.
+    /// This is what Konsole does on "Clear History and Reset" so an idle
+    /// prompt stays on screen even when the shell never repaints it.
+    pub fn reset_keeping_prompt(&mut self) {
+        let screen_lines = self.screen_lines() as i32;
+        let prompt = self.cursor.pos.row.0.clamp(0, screen_lines - 1);
+        let column = self.cursor.pos.col;
+
+        self.clear_history();
+        self.saved_cursor = Cursor::default();
+        self.cursor = Cursor::default();
+        self.display_offset = 0;
+
+        for line in 0..(screen_lines - prompt) {
+            self.raw.swap(Line(line), Line(line + prompt));
+        }
+        for line in (screen_lines - prompt)..screen_lines {
+            self.raw[Line(line)].reset(&self.cursor.template);
+        }
+        self.cursor.pos.col = column;
+    }
 }
 
 impl<T> Grid<T> {

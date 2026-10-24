@@ -1493,6 +1493,7 @@ impl Screen<'_> {
                         drop(terminal);
                         self.mark_dirty();
                     }
+                    Act::ClearHistoryAndReset => self.clear_history_and_reset(),
                     Act::ToggleFullscreen => self.context_manager.toggle_full_screen(),
                     Act::ToggleAppearanceTheme => {
                         self.context_manager.toggle_appearance_theme();
@@ -2045,6 +2046,28 @@ impl Screen<'_> {
         terminal.selection.take();
         drop(terminal);
         self.context_manager.current_mut().set_selection(None);
+    }
+
+    fn clear_history_and_reset(&mut self) {
+        self.stop_hint_mode_if_active();
+        self.clear_highlighted_hint();
+        // Discard search state rather than cancelling into a selection of
+        // text that is about to disappear (which would also claim PRIMARY).
+        self.search_state.dfas = None;
+        self.exit_search();
+        self.clear_selection();
+
+        let current = self.context_manager.current_mut();
+        current.terminal.lock().clear_history_and_reset();
+        let size = crate::renderer::utils::terminal_dimensions(&current.dimension);
+        current.messenger.send_refresh(size);
+        current
+            .renderable_content
+            .pending_update
+            .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+        self.renderer.scrollbar.notify_scroll(current.rich_text_id);
+        // The cursor jumps to the top of the screen; do not animate it.
+        self.renderer.trail_cursor.snap();
     }
 
     #[inline]
@@ -4117,6 +4140,7 @@ impl Screen<'_> {
                 let mut terminal = self.context_manager.current_mut().terminal.lock();
                 terminal.clear_saved_history();
             }
+            PaletteAction::ClearHistoryAndReset => self.clear_history_and_reset(),
             PaletteAction::ListFonts => {
                 // Handled in the router: switches the palette into fonts
                 // mode and keeps it open. If we land here it's either a

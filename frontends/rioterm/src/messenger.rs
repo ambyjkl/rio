@@ -28,6 +28,11 @@ impl Messenger {
     }
 
     #[inline]
+    pub fn send_refresh(&self, size: WindowSize) {
+        let _ = self.channel.send(Msg::Refresh(size));
+    }
+
+    #[inline]
     pub fn send_resize(&self, new_size: WindowSize) -> Result<&str, String> {
         match self.channel.send(Msg::Resize(new_size)) {
             Ok(..) => Ok("Resized"),

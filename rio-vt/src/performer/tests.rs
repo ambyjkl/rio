@@ -18,6 +18,8 @@ struct TestPty {
     shutdown_calls: usize,
     deregister_calls: usize,
     raw_error: Option<i32>,
+    sizes: Vec<WinsizeBuilder>,
+    fail_resize_call: Option<usize>,
 }
 
 impl Read for TestPty {
@@ -54,8 +56,13 @@ impl ProcessReadWrite for TestPty {
     fn write_token(&self) -> corcovado::Token {
         1.into()
     }
-    fn set_winsize(&mut self, _: WinsizeBuilder) -> io::Result<()> {
-        Ok(())
+    fn set_winsize(&mut self, size: WinsizeBuilder) -> io::Result<()> {
+        self.sizes.push(size);
+        if self.fail_resize_call == Some(self.sizes.len()) {
+            Err(io::Error::from(ErrorKind::Other))
+        } else {
+            Ok(())
+        }
     }
     fn register(
         &mut self,
@@ -134,6 +141,8 @@ fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidLi
             shutdown_calls: 0,
             deregister_calls: 0,
             raw_error: None,
+            sizes: Vec::new(),
+            fail_resize_call: None,
         },
         VoidListener,
         WindowId::from(0),
@@ -330,6 +339,74 @@ fn hangup_without_readable_readiness_drains_residual_output() {
     assert_eq!(first_line(&machine, 12), "final output");
     assert_eq!(machine.pty.shutdown_calls, 1);
     assert_eq!(machine.pty.deregister_calls, 1);
+}
+
+#[test]
+fn refresh_requests_redraw_without_input_or_grid_resize() {
+    let mut machine = machine(Vec::new(), None);
+    let size = crate::event::WindowSize {
+        rows: 24,
+        cols: 80,
+        width: 800,
+        height: 480,
+    };
+    machine.channel().send(Msg::Refresh(size)).unwrap();
+    let mut state = State::default();
+    assert!(machine.drain_recv_channel(&mut state));
+    let sizes: Vec<_> = machine
+        .pty
+        .sizes
+        .iter()
+        .map(|size| (size.rows, size.cols, size.width, size.height))
+        .collect();
+    assert_eq!(sizes, [(24, 81, 801, 480), (24, 80, 800, 480)]);
+    assert!(state.write_list.is_empty());
+    assert!(machine.pty.writer.is_empty());
+    let terminal = machine.terminal.lock();
+    assert_eq!(terminal.columns(), 80);
+    assert_eq!(terminal.screen_lines(), 24);
+}
+
+#[test]
+fn refresh_restores_size_even_if_the_first_resize_fails() {
+    let mut machine = machine(Vec::new(), None);
+    machine.pty.fail_resize_call = Some(1);
+    let size = crate::event::WindowSize {
+        rows: 24,
+        cols: 80,
+        width: 800,
+        height: 480,
+    };
+    assert!(machine.refresh_pty(size).is_err());
+    assert_eq!(machine.pty.sizes.len(), 2);
+    let restored = &machine.pty.sizes[1];
+    assert_eq!(
+        (
+            restored.rows,
+            restored.cols,
+            restored.width,
+            restored.height
+        ),
+        (size.rows, size.cols, size.width, size.height)
+    );
+}
+
+#[test]
+fn refresh_handles_maximum_dimensions_without_overflow() {
+    let mut machine = machine(Vec::new(), None);
+    for cols in [i16::MAX as u16, u16::MAX] {
+        machine.pty.sizes.clear();
+        let size = crate::event::WindowSize {
+            rows: u16::MAX,
+            cols,
+            width: u16::MAX,
+            height: u16::MAX,
+        };
+        machine.refresh_pty(size).unwrap();
+        assert_eq!(machine.pty.sizes[0].cols, cols - 1);
+        assert_eq!(machine.pty.sizes[1].cols, cols);
+        assert_eq!(machine.pty.sizes[1].width, u16::MAX);
+    }
 }
 
 #[test]
