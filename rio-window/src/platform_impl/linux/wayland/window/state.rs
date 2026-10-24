@@ -22,7 +22,7 @@ use sctk::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as 
 
 use sctk::compositor::{CompositorState, Region, SurfaceData, SurfaceDataExt};
 use sctk::seat::pointer::{PointerDataExt, ThemedPointer};
-use sctk::shell::xdg::window::{DecorationMode, Window, WindowConfigure};
+use sctk::shell::xdg::window::{DecorationMode, WindowConfigure};
 use sctk::shell::xdg::XdgSurface;
 use sctk::shell::WaylandSurface;
 use sctk::shm::slot::SlotPool;
@@ -35,6 +35,7 @@ use crate::cursor::CustomCursor as RootCustomCursor;
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalSize, Size};
 use crate::error::{ExternalError, NotSupportedError};
 use crate::platform_impl::wayland::logical_to_physical_rounded;
+use crate::platform_impl::wayland::output::MonitorHandle;
 use crate::platform_impl::wayland::types::cursor::{CustomCursor, SelectedCursor};
 use crate::platform_impl::wayland::types::ext_background_effect::ExtBackgroundEffectManager;
 use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
@@ -50,6 +51,8 @@ use crate::platform_impl::wayland::state::{WindowCompositorUpdate, WinitState};
 pub type WinitFrame = sctk_adwaita::AdwaitaFrame<WinitState>;
 #[cfg(not(feature = "sctk-adwaita"))]
 pub type WinitFrame = sctk::shell::xdg::fallback_frame::FallbackFrame<WinitState>;
+
+use super::shell::ShellWindow;
 
 // Minimum window inner size.
 const MIN_WINDOW_SIZE: LogicalSize<u32> = LogicalSize::new(2, 1);
@@ -67,6 +70,24 @@ pub struct WindowState {
 
     /// The last received configure.
     pub last_configure: Option<WindowConfigure>,
+
+    /// Layer-shell has no xdg states or decorations.
+    pub layer_configured: bool,
+    /// The compositor retired the role; the terminal and desired visibility
+    /// survive until an output is available for a new role.
+    pub layer_closed: bool,
+
+    /// Bound automatic recovery to one attempt per output-topology change.
+    /// A compositor may reject a layer for reasons other than output removal.
+    pub layer_recovery_attempted: bool,
+
+    /// Whether the application wants the surface mapped. Hidden windows must
+    /// not receive redraws, or presenting a buffer would map them again.
+    pub visible: bool,
+
+    /// Unlike an initially hidden surface, an unmapped surface needs a new
+    /// configure before presenting again. Old in-flight configures don't count.
+    pub remap_required: bool,
 
     /// The pointers observed on the window.
     pub pointers: Vec<Weak<ThemedPointer<WinitPointerData>>>,
@@ -154,8 +175,8 @@ pub struct WindowState {
     /// The value is the serial of the event triggered moved.
     has_pending_move: Option<u32>,
 
-    /// The underlying SCTK window.
-    pub window: Window,
+    /// The shared shell role and stable underlying surface.
+    pub window: ShellWindow,
 
     // NOTE: The spec says that destroying parent(`window` in our case), will unmap the
     // subsurfaces. Thus to achieve atomic unmap of the client, drop the decorations
@@ -172,7 +193,7 @@ impl WindowState {
         queue_handle: &QueueHandle<WinitState>,
         winit_state: &WinitState,
         initial_size: Size,
-        window: Window,
+        window: ShellWindow,
         theme: Option<Theme>,
     ) -> Self {
         let compositor = winit_state.compositor_state.clone();
@@ -203,11 +224,16 @@ impl WindowState {
             fractional_scale,
             frame: None,
             frame_callback_state: FrameCallbackState::None,
+            visible: true,
+            remap_required: false,
             seat_focus: Default::default(),
             has_pending_move: None,
             ime_allowed: false,
             ime_purpose: ImePurpose::Normal,
             last_configure: None,
+            layer_configured: false,
+            layer_closed: false,
+            layer_recovery_attempted: false,
             max_inner_size: None,
             min_inner_size: MIN_WINDOW_SIZE,
             pointer_constraints,
@@ -290,7 +316,7 @@ impl WindowState {
                 && !self.csd_fails
         }) {
             match WinitFrame::new(
-                &self.window,
+                self.window.xdg().expect("xdg configure for a layer window"),
                 shm,
                 #[cfg(feature = "sctk-adwaita")]
                 self.compositor.clone(),
@@ -382,6 +408,60 @@ impl WindowState {
         }
     }
 
+    /// Retire only the layer role, preserving the wl_surface and application
+    /// visibility. Rendering stays blocked until a replacement is configured.
+    pub fn suspend_layer(&mut self) {
+        let Some(layer) = self.window.layer() else {
+            return;
+        };
+        self.window.wl_surface().attach(None, 0, 0);
+        self.window.commit();
+        layer.destroy_role();
+        self.layer_closed = true;
+        self.layer_configured = false;
+        self.remap_required = true;
+        self.frame_callback_reset();
+    }
+
+    pub fn remap_layer(&mut self, monitors: &[MonitorHandle]) {
+        let Some(layer) = self.window.layer() else {
+            return;
+        };
+        layer.recreate(true, &self.queue_handle, monitors);
+        self.layer_closed = false;
+        self.layer_configured = false;
+        self.remap_required = false;
+        self.frame_callback_reset();
+        self.reload_transparency_hint();
+        // Bufferless commit: never reuse the old configure or buffer.
+        self.window.commit();
+    }
+
+    pub fn configure_layer(&mut self, new_size: (u32, u32)) -> bool {
+        if let Some(initial_size) = self.initial_size.take() {
+            self.size = initial_size.to_logical(self.scale_factor());
+            if let Some(layer) = self.window.layer() {
+                layer.set_size(self.size);
+            }
+        }
+        let size = LogicalSize::new(
+            if new_size.0 == 0 {
+                self.size.width.max(1)
+            } else {
+                new_size.0
+            },
+            if new_size.1 == 0 {
+                self.size.height.max(1)
+            } else {
+                new_size.1
+            },
+        );
+        let resized = !self.layer_configured || size != self.size;
+        self.layer_configured = true;
+        self.resize(size);
+        resized
+    }
+
     /// Compute the bounds for the inner size of the surface.
     fn inner_size_bounds(
         &self,
@@ -416,7 +496,11 @@ impl WindowState {
         &self,
         direction: ResizeDirection,
     ) -> Result<(), ExternalError> {
-        let xdg_toplevel = self.window.xdg_toplevel();
+        let window = self
+            .window
+            .xdg()
+            .ok_or_else(|| ExternalError::NotSupported(NotSupportedError::new()))?;
+        let xdg_toplevel = window.xdg_toplevel();
 
         // TODO(kchibisov) handle touch serials.
         self.apply_on_pointer(|_, data| {
@@ -430,7 +514,11 @@ impl WindowState {
 
     /// Start the window drag.
     pub fn drag_window(&self) -> Result<(), ExternalError> {
-        let xdg_toplevel = self.window.xdg_toplevel();
+        let window = self
+            .window
+            .xdg()
+            .ok_or_else(|| ExternalError::NotSupported(NotSupportedError::new()))?;
+        let xdg_toplevel = window.xdg_toplevel();
         // TODO(kchibisov) handle touch serials.
         self.apply_on_pointer(|_, data| {
             let serial = data.latest_button_serial();
@@ -453,10 +541,11 @@ impl WindowState {
         window_id: WindowId,
         updates: &mut Vec<WindowCompositorUpdate>,
     ) -> Option<bool> {
+        let window = self.window.xdg()?;
         match self.frame.as_mut()?.on_click(timestamp, click, pressed)? {
-            FrameAction::Minimize => self.window.set_minimized(),
-            FrameAction::Maximize => self.window.set_maximized(),
-            FrameAction::UnMaximize => self.window.unset_maximized(),
+            FrameAction::Minimize => window.set_minimized(),
+            FrameAction::Maximize => window.set_maximized(),
+            FrameAction::UnMaximize => window.unset_maximized(),
             FrameAction::Close => WinitState::queue_close(updates, window_id),
             FrameAction::Move => self.has_pending_move = Some(serial),
             FrameAction::Resize(edge) => {
@@ -472,11 +561,9 @@ impl WindowState {
                     ResizeEdge::BottomRight => XdgResizeEdge::BottomRight,
                     _ => return None,
                 };
-                self.window.resize(seat, serial, edge);
+                window.resize(seat, serial, edge);
             }
-            FrameAction::ShowMenu(x, y) => {
-                self.window.show_window_menu(seat, serial, (x, y))
-            }
+            FrameAction::ShowMenu(x, y) => window.show_window_menu(seat, serial, (x, y)),
             _ => (),
         };
 
@@ -506,7 +593,9 @@ impl WindowState {
             // If we have a cursor change, that means that cursor is over the decorations,
             // so try to apply move.
             if let Some(serial) = cursor.is_some().then_some(serial).flatten() {
-                self.window.move_(seat, serial);
+                if let Some(window) = self.window.xdg() {
+                    window.move_(seat, serial);
+                }
                 None
             } else {
                 cursor
@@ -519,7 +608,7 @@ impl WindowState {
     /// Get the stored resizable state.
     #[inline]
     pub fn resizable(&self) -> bool {
-        self.resizable
+        self.window.xdg().is_some() && self.resizable
     }
 
     /// Set the resizable state on the window.
@@ -527,6 +616,9 @@ impl WindowState {
     /// Returns `true` when the state was applied.
     #[inline]
     pub fn set_resizable(&mut self, resizable: bool) -> bool {
+        if self.window.layer().is_some() {
+            return false;
+        }
         if self.resizable == resizable {
             return false;
         }
@@ -569,11 +661,18 @@ impl WindowState {
     /// Whether the window received initial configure event from the compositor.
     #[inline]
     pub fn is_configured(&self) -> bool {
-        self.last_configure.is_some()
+        if self.window.layer().is_some() {
+            self.layer_configured && !self.layer_closed
+        } else {
+            self.last_configure.is_some()
+        }
     }
 
     #[inline]
     pub fn is_decorated(&mut self) -> bool {
+        if self.window.layer().is_some() {
+            return false;
+        }
         let csd = self
             .last_configure
             .as_ref()
@@ -658,6 +757,9 @@ impl WindowState {
 
     /// Try to resize the window when the user can do so.
     pub fn request_inner_size(&mut self, inner_size: Size) -> PhysicalSize<u32> {
+        if let Some(layer) = self.window.layer() {
+            layer.set_size(inner_size.to_logical(self.scale_factor()));
+        }
         if self
             .last_configure
             .as_ref()
@@ -675,7 +777,14 @@ impl WindowState {
         self.size = inner_size;
 
         // Update the stateless size.
-        if Some(true) == self.last_configure.as_ref().map(Self::is_stateless) {
+        if self
+            .last_configure
+            .as_ref()
+            .map(Self::is_stateless)
+            .unwrap_or(true)
+        {
+            // A hidden/remapping surface has no configure yet. Remember size
+            // requests made in that state for the next bufferless configure.
             self.stateless_size = inner_size;
         }
 
@@ -701,12 +810,14 @@ impl WindowState {
         self.reload_transparency_hint();
 
         // Set the window geometry.
-        self.window.xdg_surface().set_window_geometry(
-            x,
-            y,
-            outer_size.width as i32,
-            outer_size.height as i32,
-        );
+        if let Some(window) = self.window.xdg() {
+            window.xdg_surface().set_window_geometry(
+                x,
+                y,
+                outer_size.width as i32,
+                outer_size.height as i32,
+            );
+        }
 
         // Update the target viewport, this is used if and only if fractional scaling is in use.
         if let Some(viewport) = self.viewport.as_ref() {
@@ -812,7 +923,9 @@ impl WindowState {
             .unwrap_or(size);
 
         self.min_inner_size = size;
-        self.window.set_min_size(Some(size.into()));
+        if let Some(window) = self.window.xdg() {
+            window.set_min_size(Some(size.into()));
+        }
     }
 
     /// Set maximum inner window size.
@@ -825,7 +938,9 @@ impl WindowState {
         });
 
         self.max_inner_size = size;
-        self.window.set_max_size(size.map(Into::into));
+        if let Some(window) = self.window.xdg() {
+            window.set_max_size(size.map(Into::into));
+        }
     }
 
     /// Set the CSD theme.
@@ -915,12 +1030,16 @@ impl WindowState {
     }
 
     pub fn show_window_menu(&self, position: LogicalPosition<u32>) {
-        // TODO(kchibisov) handle touch serials.
-        self.apply_on_pointer(|_, data| {
-            let serial = data.latest_button_serial();
-            let seat = data.seat();
-            self.window.show_window_menu(seat, serial, position.into());
-        });
+        if let Some(window) = self.window.xdg() {
+            // TODO(kchibisov) handle touch serials.
+            self.apply_on_pointer(|_, data| {
+                window.show_window_menu(
+                    data.seat(),
+                    data.latest_button_serial(),
+                    position.into(),
+                );
+            });
+        }
     }
 
     /// Set the position of the cursor.
@@ -972,6 +1091,9 @@ impl WindowState {
     /// Whether show or hide client side decorations.
     #[inline]
     pub fn set_decorate(&mut self, decorate: bool) {
+        let Some(window) = self.window.xdg() else {
+            return;
+        };
         if decorate == self.decorate {
             return;
         }
@@ -985,12 +1107,11 @@ impl WindowState {
         {
             Some(DecorationMode::Server) if !self.decorate => {
                 // To disable decorations we should request client and hide the frame.
-                self.window
-                    .request_decoration_mode(Some(DecorationMode::Client))
+                window.request_decoration_mode(Some(DecorationMode::Client))
             }
-            _ if self.decorate => self
-                .window
-                .request_decoration_mode(Some(DecorationMode::Server)),
+            _ if self.decorate => {
+                window.request_decoration_mode(Some(DecorationMode::Server))
+            }
             _ => (),
         }
 
@@ -1141,7 +1262,9 @@ impl WindowState {
             frame.set_title(&title);
         }
 
-        self.window.set_title(&title);
+        if let Some(window) = self.window.xdg() {
+            window.set_title(&title);
+        }
         self.title = title;
     }
 

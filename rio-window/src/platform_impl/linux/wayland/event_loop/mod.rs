@@ -502,6 +502,26 @@ impl<T: 'static> EventLoop<T> {
                     .lock()
                     .unwrap();
 
+                // Output loss retires a layer role, not the terminal. Defer
+                // recovery until the whole batch of output/closed events has
+                // been dispatched, and never retry continuously if rejected.
+                if window.visible
+                    && window.layer_closed
+                    && !window.layer_recovery_attempted
+                {
+                    let monitors = state.monitors.lock().unwrap();
+                    if !monitors.is_empty() {
+                        window.layer_recovery_attempted = true;
+                        window.remap_layer(&monitors);
+                    }
+                }
+
+                // A new configure/ack handshake is mandatory after remapping.
+                // Never present into a hidden or not-yet-configured surface.
+                if !window.visible || !window.is_configured() {
+                    return None;
+                }
+
                 if window.frame_callback_state() == FrameCallbackState::Requested {
                     return None;
                 }
@@ -555,7 +575,10 @@ impl<T: 'static> EventLoop<T> {
             wake_up |= self.with_state(|state| {
                 match state.windows.get_mut().get_mut(&window_id) {
                     Some(window) => {
-                        let refresh = window.lock().unwrap().refresh_frame();
+                        let mut window = window.lock().unwrap();
+                        let refresh = window.visible
+                            && window.is_configured()
+                            && window.refresh_frame();
                         if refresh {
                             state
                                 .window_requests

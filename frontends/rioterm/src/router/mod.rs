@@ -11,6 +11,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use rio_backend::clipboard::Clipboard;
 use rio_backend::config::Config as RioConfig;
 use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
+pub(crate) use window::{quake_fills_monitor, quake_size};
 
 use rio_backend::event::WindowId;
 use rio_window::dpi::{PhysicalPosition, PhysicalSize};
@@ -594,6 +595,7 @@ impl Router<'_> {
             None,
             None,
             false,
+            None,
         );
         let id: WindowId = window.winit_window.id().into();
         let route = Route::new(Assistant::new(), RoutePath::Terminal, window);
@@ -658,6 +660,7 @@ impl Router<'_> {
             open_url,
             app_id,
             false,
+            None,
         );
         let id: WindowId = window.winit_window.id().into();
 
@@ -684,6 +687,7 @@ impl Router<'_> {
         event_loop: &'a ActiveEventLoop,
         event_proxy: EventProxy,
         config: &'a rio_backend::config::Config,
+        monitor: Option<rio_window::monitor::MonitorHandle>,
     ) {
         let window = RouteWindow::from_target(
             event_loop,
@@ -695,6 +699,7 @@ impl Router<'_> {
             None,
             None,
             true,
+            monitor,
         );
         let id: WindowId = window.winit_window.id().into();
         self.routes.insert(
@@ -729,6 +734,7 @@ impl Router<'_> {
             open_url,
             None,
             false,
+            None,
         );
         self.routes.insert(
             window.winit_window.id().into(),
@@ -856,6 +862,7 @@ impl<'a> RouteWindow<'a> {
         open_url: Option<String>,
         app_id: Option<&str>,
         quake: bool,
+        quake_monitor: Option<rio_window::monitor::MonitorHandle>,
     ) -> RouteWindow<'a> {
         #[allow(unused_mut)]
         let mut window_builder =
@@ -865,7 +872,30 @@ impl<'a> RouteWindow<'a> {
         // monitor under the cursor and shows it (position changes on
         // every toggle, not just at creation).
         if quake {
+            // Geometry must be specified before Wayland's initial configure.
+            if let Some(monitor) = &quake_monitor {
+                window_builder = window_builder.with_inner_size(quake_size(
+                    &config.window,
+                    monitor.size(),
+                    monitor.scale_factor(),
+                ));
+            }
             window_builder = window_builder.with_visible(false);
+            #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+            {
+                use rio_window::platform::wayland::ActiveEventLoopExtWayland;
+                if event_loop.is_wayland() {
+                    // Fixed-size hints keep tiling compositors from replacing
+                    // the configured dropdown dimensions with a tile's size.
+                    use rio_window::platform::wayland::WindowAttributesExtWayland;
+                    window_builder = window_builder
+                        .with_resizable(false)
+                        .with_quake_overlay(true);
+                    // Fullscreen/min-max workarounds are only for the xdg
+                    // fallback. Layer-shell overlays cover the requested output
+                    // directly without belonging to a virtual desktop.
+                }
+            }
         }
 
         #[cfg(not(any(target_os = "macos", windows)))]
@@ -892,7 +922,7 @@ impl<'a> RouteWindow<'a> {
             Screen::new(properties, config, event_proxy, font_library, open_url)
                 .expect("Screen not created");
 
-        if config.window.columns.is_some() || config.window.rows.is_some() {
+        if !quake && (config.window.columns.is_some() || config.window.rows.is_some()) {
             let (physical_width, physical_height) = compute_window_size_from_grid(
                 config.window.columns,
                 config.window.rows,

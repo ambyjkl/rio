@@ -9,7 +9,7 @@ use sctk::reexports::client::{Proxy, QueueHandle};
 
 use sctk::compositor::{CompositorState, Region, SurfaceData};
 use sctk::reexports::protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
-use sctk::shell::xdg::window::{Window as SctkWindow, WindowDecorations};
+use sctk::shell::xdg::window::WindowDecorations;
 use sctk::shell::WaylandSurface;
 
 use tracing::warn;
@@ -32,17 +32,23 @@ use super::state::WinitState;
 use super::types::xdg_activation::XdgActivationTokenData;
 use super::{ActiveEventLoop, WaylandError, WindowId};
 
+mod shell;
 pub(crate) mod state;
+
+use shell::{LayerWindow, ShellWindow};
 
 pub use state::WindowState;
 
 /// The Wayland window.
 pub struct Window {
-    /// Reference to the underlying SCTK window.
-    window: SctkWindow,
+    /// Shared shell role and stable underlying surface.
+    window: ShellWindow,
 
     /// Window id.
     window_id: WindowId,
+
+    /// Restored after unmapping, which resets xdg_toplevel attributes.
+    app_id: Option<String>,
 
     /// The state of the window.
     window_state: Arc<Mutex<WindowState>>,
@@ -106,11 +112,33 @@ impl Window {
             WindowDecorations::RequestClient
         };
 
-        let window = state.xdg_shell.create_window(
-            surface.clone(),
-            default_decorations,
-            &queue_handle,
-        );
+        let app_id = attributes.platform_specific.name.map(|name| name.general);
+        let window = if attributes.platform_specific.quake_overlay {
+            if let Some(layer_shell) = &state.layer_shell {
+                ShellWindow::Layer(Arc::new(LayerWindow::new(
+                    surface.clone(),
+                    layer_shell,
+                    app_id.clone().unwrap_or_else(|| "rio-quake".into()),
+                    size.to_logical(1.),
+                    attributes.active,
+                    attributes.visible,
+                    &queue_handle,
+                )))
+            } else {
+                warn!("Wayland layer-shell unavailable; falling back to an xdg quake window");
+                ShellWindow::Xdg(state.xdg_shell.create_window(
+                    surface.clone(),
+                    default_decorations,
+                    &queue_handle,
+                ))
+            }
+        } else {
+            ShellWindow::Xdg(state.xdg_shell.create_window(
+                surface.clone(),
+                default_decorations,
+                &queue_handle,
+            ))
+        };
 
         let mut window_state = WindowState::new(
             event_loop_window_target.connection.clone(),
@@ -132,8 +160,8 @@ impl Window {
         window_state.set_decorate(attributes.decorations);
 
         // Set the app_id.
-        if let Some(name) = attributes.platform_specific.name.map(|name| name.general) {
-            window.set_app_id(name);
+        if let (Some(window), Some(name)) = (window.xdg(), &app_id) {
+            window.set_app_id(name.clone());
         }
 
         // Set the window title.
@@ -150,23 +178,25 @@ impl Window {
         window_state.set_resizable(attributes.resizable);
 
         // Set startup mode.
-        match attributes.fullscreen.map(Into::into) {
-            Some(Fullscreen::Exclusive(_)) => {
-                warn!("`Fullscreen::Exclusive` is ignored on Wayland");
-            }
-            #[cfg_attr(not(x11_platform), allow(clippy::bind_instead_of_map))]
-            Some(Fullscreen::Borderless(monitor)) => {
-                let output = monitor.and_then(|monitor| match monitor {
-                    PlatformMonitorHandle::Wayland(monitor) => Some(monitor.proxy),
-                    #[cfg(x11_platform)]
-                    PlatformMonitorHandle::X(_) => None,
-                });
+        if let Some(window) = window.xdg() {
+            match attributes.fullscreen.map(Into::into) {
+                Some(Fullscreen::Exclusive(_)) => {
+                    warn!("`Fullscreen::Exclusive` is ignored on Wayland");
+                }
+                #[cfg_attr(not(x11_platform), allow(clippy::bind_instead_of_map))]
+                Some(Fullscreen::Borderless(monitor)) => {
+                    let output = monitor.and_then(|monitor| match monitor {
+                        PlatformMonitorHandle::Wayland(monitor) => Some(monitor.proxy),
+                        #[cfg(x11_platform)]
+                        PlatformMonitorHandle::X(_) => None,
+                    });
 
-                window.set_fullscreen(output.as_ref())
-            }
-            _ if attributes.maximized => window.set_maximized(),
-            _ => (),
-        };
+                    window.set_fullscreen(output.as_ref())
+                }
+                _ if attributes.maximized => window.set_maximized(),
+                _ => (),
+            };
+        }
 
         match attributes.cursor {
             Cursor::Icon(icon) => window_state.set_cursor(icon),
@@ -218,12 +248,26 @@ impl Window {
 
         // XXX Wait for the initial configure to arrive.
         while !window_state.lock().unwrap().is_configured() {
+            if window_state.lock().unwrap().layer_closed {
+                state.windows.get_mut().remove(&window_id);
+                state.window_requests.get_mut().remove(&window_id);
+                state
+                    .window_compositor_updates
+                    .retain(|update| update.window_id != window_id);
+                return Err(os_error!(OsError::Misc(
+                    "layer surface closed before initial configure"
+                )));
+            }
             event_queue.blocking_dispatch(&mut state).map_err(|error| {
                 os_error!(OsError::WaylandError(Arc::new(WaylandError::Dispatch(
                     error
                 ))))
             })?;
         }
+
+        // No buffer has been attached, so this never maps an initially hidden
+        // window. Layer windows still recreate their role on the first show.
+        window_state.lock().unwrap().visible = attributes.visible;
 
         // Wake-up event loop, so it'll send initial redraw requested.
         let event_loop_awakener = event_loop_window_target.event_loop_awakener.clone();
@@ -234,6 +278,7 @@ impl Window {
             display,
             monitors,
             window_id,
+            app_id,
             compositor,
             window_state,
             queue_handle,
@@ -259,13 +304,58 @@ impl Window {
     }
 
     #[inline]
-    pub fn set_visible(&self, _visible: bool) {
-        // Not possible on Wayland.
+    pub fn set_visible(&self, visible: bool) {
+        let mut state = self.window_state.lock().unwrap();
+        if state.visible == visible && !(visible && state.layer_closed) {
+            return;
+        }
+        state.visible = visible;
+        state.frame_callback_reset();
+        if visible {
+            if self.window.layer().is_some() {
+                // Explicit show permits a fresh attempt, including when the
+                // desired visibility was already true during disconnection.
+                state.layer_recovery_attempted = false;
+                let monitors = self.monitors.lock().unwrap();
+                if monitors.is_empty() {
+                    state.suspend_layer();
+                } else {
+                    state.remap_layer(&monitors);
+                }
+            } else if let Some(window) = self.window.xdg() {
+                if state.remap_required {
+                    state.last_configure = None;
+                }
+                // Unmapping resets xdg_toplevel metadata and size hints.
+                window.set_title(state.title());
+                if let Some(app_id) = &self.app_id {
+                    window.set_app_id(app_id.clone());
+                }
+                state.reload_min_max_hints();
+                state.remap_required = false;
+                state.reload_transparency_hint();
+                self.window.commit();
+            }
+            self.window_requests
+                .redraw_requested
+                .store(true, Ordering::Relaxed);
+        } else {
+            self.window.wl_surface().attach(None, 0, 0);
+            self.window.commit();
+            state.last_configure = None;
+            state.layer_configured = false;
+            // Destroying the role also releases any exclusive keyboard focus.
+            if let Some(layer) = self.window.layer() {
+                layer.destroy_role();
+            }
+            state.remap_required = true;
+        }
+        self.event_loop_awakener.ping();
     }
 
     #[inline]
     pub fn is_visible(&self) -> Option<bool> {
-        None
+        Some(self.window_state.lock().unwrap().visible)
     }
 
     #[inline]
@@ -460,7 +550,9 @@ impl Window {
             return;
         }
 
-        self.window.set_minimized();
+        if let Some(window) = self.window.xdg() {
+            window.set_minimized();
+        }
     }
 
     #[inline]
@@ -476,10 +568,12 @@ impl Window {
 
     #[inline]
     pub fn set_maximized(&self, maximized: bool) {
-        if maximized {
-            self.window.set_maximized()
-        } else {
-            self.window.unset_maximized()
+        if let Some(window) = self.window.xdg() {
+            if maximized {
+                window.set_maximized()
+            } else {
+                window.unset_maximized()
+            }
         }
     }
 
@@ -505,6 +599,9 @@ impl Window {
 
     #[inline]
     pub(crate) fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
+        let Some(window) = self.window.xdg() else {
+            return;
+        };
         match fullscreen {
             Some(Fullscreen::Exclusive(_)) => {
                 warn!("`Fullscreen::Exclusive` is ignored on Wayland");
@@ -517,9 +614,9 @@ impl Window {
                     PlatformMonitorHandle::X(_) => None,
                 });
 
-                self.window.set_fullscreen(output.as_ref())
+                window.set_fullscreen(output.as_ref())
             }
-            None => self.window.unset_fullscreen(),
+            None => window.unset_fullscreen(),
         }
     }
 
@@ -661,6 +758,41 @@ impl Window {
     #[inline]
     pub fn focus_window(&self) {}
 
+    pub fn is_quake_overlay(&self) -> bool {
+        self.window.layer().is_some()
+    }
+
+    pub fn prepare_quake_overlay(
+        &self,
+        size: LogicalSize<f64>,
+        output: Option<PlatformMonitorHandle>,
+    ) {
+        let Some(layer) = self.window.layer() else {
+            return;
+        };
+        let mut state = self.window_state.lock().unwrap();
+        if state.visible && !state.layer_closed {
+            return;
+        }
+        let output = output.and_then(|output| match output {
+            PlatformMonitorHandle::Wayland(output) => Some(output.proxy),
+            #[cfg(x11_platform)]
+            PlatformMonitorHandle::X(_) => None,
+        });
+        layer.set_output(output);
+        state.request_inner_size(Size::Logical(LogicalSize::new(
+            size.width.max(1.),
+            size.height.max(1.),
+        )));
+    }
+
+    pub fn activate_with_token(&self, token: String) {
+        if let Some(activation) = &self.xdg_activation {
+            activation.activate(token, self.window.wl_surface());
+            self.event_loop_awakener.ping();
+        }
+    }
+
     #[inline]
     pub fn surface(&self) -> &WlSurface {
         self.window.wl_surface()
@@ -669,7 +801,12 @@ impl Window {
     #[inline]
     pub fn current_monitor(&self) -> Option<MonitorHandle> {
         let data = self.window.wl_surface().data::<SurfaceData>()?;
-        data.outputs().next().map(MonitorHandle::new)
+        // A compositor need not send surface.leave before removing an output.
+        // SCTK can therefore retain old proxies across a layer remap.
+        let monitors = self.monitors.lock().unwrap();
+        data.outputs()
+            .find(|output| monitors.iter().any(|monitor| monitor.proxy == *output))
+            .map(MonitorHandle::new)
     }
 
     #[inline]
