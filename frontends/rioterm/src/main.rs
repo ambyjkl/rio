@@ -5,6 +5,8 @@
 #![windows_subsystem = "windows"]
 
 mod application;
+#[cfg(target_os = "linux")]
+mod system_bell;
 mod bindings;
 mod cli;
 mod constants;

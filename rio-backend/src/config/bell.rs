@@ -20,13 +20,28 @@ impl Default for Bell {
 }
 
 fn default_audio_bell() -> bool {
-    // Enable audio bell by default on macOS and Windows since they use the system sound
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    // These platforms use the system sound.
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
         true
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Bell;
+
+    #[test]
+    fn audio_default_and_explicit_false() {
+        let default: Bell = toml::from_str("").unwrap();
+        assert_eq!(default.audio, Bell::default().audio);
+        #[cfg(target_os = "linux")]
+        assert!(default.audio);
+        let disabled: Bell = toml::from_str("audio = false").unwrap();
+        assert!(!disabled.audio);
     }
 }
