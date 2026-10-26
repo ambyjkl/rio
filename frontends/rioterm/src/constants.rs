@@ -18,6 +18,7 @@ pub const MULTI_CLICK_THRESHOLD: std::time::Duration =
 #[cfg(all(
     feature = "audio",
     not(target_os = "macos"),
-    not(target_os = "windows")
+    not(target_os = "windows"),
+    not(target_os = "linux")
 ))]
 pub const BELL_DURATION: std::time::Duration = std::time::Duration::from_millis(200);

@@ -46,3 +46,14 @@ If you use and like Rio, please consider sponsoring it: your support helps to co
 ## Minimal stable rust version
 
 Rio's MSRV is 1.96.1.
+
+### Terminal bell on Linux
+
+On Linux, terminal BEL requests the `bell-window-system` event through
+libcanberra by default. Rio loads `libcanberra.so.0` at runtime; if it or the
+sound event is unavailable, the bell is silent. Unlike `canberra-gtk-play`,
+Rio does not apply GTK sound-theme settings, so libcanberra's backend and
+fallback theme may differ from the desktop theme (including KDE's Ocean).
+This does not require the `audio` feature.
+To disable the sound, set `audio = false` in the `[bell]` configuration section.
+The tab indicator can be controlled separately with `tab-indicator`.

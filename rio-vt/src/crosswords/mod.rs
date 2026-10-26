@@ -8188,6 +8188,39 @@ mod tests {
     }
 
     #[test]
+    fn osc_notification_bel_terminator_does_not_ring() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            7,
+            10,
+        );
+        let mut parser = crate::performer::handler::Processor::default();
+        parser.advance(&mut term, b"\x1b]9;Hello world\x07");
+        assert!(events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, RioEvent::DesktopNotification { .. })));
+        assert!(!events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, RioEvent::Bell(_))));
+        parser.advance(&mut term, b"\x07");
+        assert!(events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, RioEvent::Bell(7))));
+    }
+
+    #[test]
     fn test_keyboard_mode_syncs_with_mode() {
         let size = CrosswordsSize::new(10, 10);
         let window_id = WindowId::from(0);
