@@ -30,6 +30,7 @@ use super::event_loop::sink::EventSink;
 use super::output::MonitorHandle;
 use super::state::WinitState;
 use super::types::xdg_activation::XdgActivationTokenData;
+use super::types::xdg_system_bell::SystemBell;
 use super::{ActiveEventLoop, WaylandError, WindowId};
 
 pub(crate) mod state;
@@ -56,6 +57,8 @@ pub struct Window {
 
     /// Xdg activation to request user attention.
     xdg_activation: Option<XdgActivationV1>,
+
+    system_bell: Option<Arc<SystemBell>>,
 
     /// The state of the requested attention from the `xdg_activation`.
     attention_requested: Arc<AtomicBool>,
@@ -92,6 +95,7 @@ impl Window {
             .xdg_activation
             .as_ref()
             .map(|activation_state| activation_state.global().clone());
+        let system_bell = state.system_bell.clone();
         let display = event_loop_window_target.connection.display();
 
         let size: Size = attributes
@@ -238,6 +242,7 @@ impl Window {
             window_state,
             queue_handle,
             xdg_activation,
+            system_bell,
             attention_requested: Arc::new(AtomicBool::new(false)),
             event_loop_awakener,
             window_requests,
@@ -539,6 +544,16 @@ impl Window {
             .lock()
             .unwrap()
             .set_cursor_visible(visible);
+    }
+
+    pub fn request_wayland_system_bell(&self) -> bool {
+        if let Some(bell) = &self.system_bell {
+            if bell.ring(self.surface()) {
+                self.event_loop_awakener.ping();
+                return true;
+            }
+        }
+        false
     }
 
     pub fn request_user_attention(&self, request_type: Option<UserAttentionType>) {

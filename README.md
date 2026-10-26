@@ -49,9 +49,11 @@ Rio's MSRV is 1.96.1.
 
 ### Terminal bell on Linux
 
-On Linux, terminal BEL requests the `bell-window-system` event through
-libcanberra by default. Rio loads `libcanberra.so.0` at runtime; if it or the
-sound event is unavailable, the bell is silent. Unlike `canberra-gtk-play`,
+On Wayland, terminal BEL requests the compositor's system bell when available;
+the compositor controls whether and how it is audible. Otherwise, on Linux,
+Rio requests the `bell-window-system` event through libcanberra. Rio loads
+`libcanberra.so.0` at runtime; if it or the sound event is unavailable, the bell
+is silent. Unlike `canberra-gtk-play`,
 Rio does not apply GTK sound-theme settings, so libcanberra's backend and
 fallback theme may differ from the desktop theme (including KDE's Ocean).
 This does not require the `audio` feature.
