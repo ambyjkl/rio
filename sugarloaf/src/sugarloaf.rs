@@ -591,6 +591,28 @@ impl Sugarloaf<'_> {
         );
     }
 
+    /// Queue a rectangle between terminal cell backgrounds and glyphs.
+    /// Coordinates are logical pixels, scaled like `rect`. Immediate-mode:
+    /// call every frame it is visible. Does not change cell/grid geometry.
+    #[inline]
+    pub fn rect_below_text(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: [f32; 4],
+    ) {
+        let scale = self.state.style.scale_factor;
+        self.renderer.rect_below_text(
+            x * scale,
+            y * scale,
+            width * scale,
+            height * scale,
+            color,
+        );
+    }
+
     /// Add a rounded rectangle. Always immediate-mode now — see `rect`.
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -885,8 +907,8 @@ impl Sugarloaf<'_> {
     /// without submitting a draw. Callers use this when they
     /// decided mid-frame to skip `render` / `render_with_grids`
     /// (e.g. "no panel is dirty, nothing to present") — without
-    /// this, the `rect` / `quad` / `text_mut().draw` calls made
-    /// earlier in the frame stay queued in `comp.batches` /
+    /// this, the `rect` / `rect_below_text` / `quad` / `text_mut().draw`
+    /// calls made earlier in the frame stay queued in the renderer /
     /// `self.text` and stack into the next real present,
     /// producing doubled overlays.
     #[inline]
@@ -1132,12 +1154,13 @@ impl Sugarloaf<'_> {
             device.cmd_set_scissor(cmd, 0, &[scissor]);
         }
 
-        // Per-panel grid passes — draw cell backgrounds + grid text
-        // underneath everything else. Vulkan doesn't yet interleave
-        // kitty image layers around the bg/text split — same as the
-        // wgpu path; follow-up.
+        // Complete all backgrounds before below-text rectangles and glyphs.
+        // Existing kitty image ordering is unchanged (as on wgpu).
         for (grid, uniforms) in grids.iter_mut() {
             grid.render_bg_vulkan(ctx, cmd, frame.slot, uniforms);
+        }
+        self.renderer.render_below_text_vulkan(cmd, &frame);
+        for (grid, uniforms) in grids.iter_mut() {
             grid.render_text_vulkan(ctx, cmd, frame.slot, uniforms);
         }
 
@@ -1253,19 +1276,13 @@ impl Sugarloaf<'_> {
                 multiview_mask: None,
             });
 
-            // Grid passes first — cell bg/text composite under
-            // the rich-text UI overlays drawn below. Wgpu
-            // doesn't yet interleave kitty image layers with
-            // the grid bg/text split (BrushRenderer::render
-            // owns kitty image draws inline), so for now the
-            // bg+text passes run back-to-back per panel —
-            // same visual result as the prior single render
-            // call. Re-ordering kitty layers around the
-            // bg/text split would require pulling image
-            // draws out of BrushRenderer::render — Metal
-            // already does that; wgpu follow-up.
+            // Complete all backgrounds before below-text rectangles and glyphs.
+            // Existing kitty image ordering remains in Renderer::render below.
             for (grid, uniforms) in grids.iter_mut() {
                 grid.render_bg_wgpu(&mut rpass, uniforms);
+            }
+            self.renderer.render_below_text_wgpu(ctx, &mut rpass);
+            for (grid, uniforms) in grids.iter_mut() {
                 grid.render_text_wgpu(&mut rpass, uniforms);
             }
 

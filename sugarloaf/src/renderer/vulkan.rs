@@ -90,6 +90,10 @@ pub struct VulkanRenderer {
     /// Allocated lazily, grown on demand.
     quad_instance_buffers: [Option<VulkanBuffer>; FRAMES_IN_FLIGHT],
     quad_instance_capacity: [usize; FRAMES_IN_FLIGHT],
+    /// Separate per-slot storage so later UI uploads cannot overwrite draws
+    /// already encoded between the grid background and glyph passes.
+    below_text_instance_buffers: [Option<VulkanBuffer>; FRAMES_IN_FLIGHT],
+    below_text_instance_capacity: [usize; FRAMES_IN_FLIGHT],
 
     // ---------- non-quad geometry pipeline ----------
     /// Renders `Vertex`-supplied geometry (`polygon()` / `line()` /
@@ -286,6 +290,8 @@ impl VulkanRenderer {
             quad_uniform_buffers,
             quad_instance_buffers: std::array::from_fn(|_| None),
             quad_instance_capacity: [0; FRAMES_IN_FLIGHT],
+            below_text_instance_buffers: std::array::from_fn(|_| None),
+            below_text_instance_capacity: [0; FRAMES_IN_FLIGHT],
             geometry_pipeline,
             geometry_vertex_buffers: std::array::from_fn(|_| None),
             geometry_vertex_capacity: [0; FRAMES_IN_FLIGHT],
@@ -556,6 +562,27 @@ impl VulkanRenderer {
         viewport: [f32; 2],
         instances: &[QuadInstance],
     ) {
+        self.render_quads_phase(cmd, slot, viewport, instances, false);
+    }
+
+    pub fn render_below_text(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        viewport: [f32; 2],
+        instances: &[QuadInstance],
+    ) {
+        self.render_quads_phase(cmd, slot, viewport, instances, true);
+    }
+
+    fn render_quads_phase(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        viewport: [f32; 2],
+        instances: &[QuadInstance],
+        below_text: bool,
+    ) {
         if instances.is_empty() {
             return;
         }
@@ -574,19 +601,32 @@ impl VulkanRenderer {
             std::ptr::write(dst, globals);
         }
 
+        // Uniforms can be shared (same viewport/colorspace), but instances
+        // must remain in distinct allocations until this slot's GPU work ends.
+        let (buffers, capacity) = if below_text {
+            (
+                &mut self.below_text_instance_buffers,
+                &mut self.below_text_instance_capacity,
+            )
+        } else {
+            (
+                &mut self.quad_instance_buffers,
+                &mut self.quad_instance_capacity,
+            )
+        };
         // Grow per-slot instance buffer if needed.
         let instance_count = instances.len();
         let needed_bytes = std::mem::size_of_val(instances);
-        if instance_count > self.quad_instance_capacity[slot] {
+        if instance_count > capacity[slot] {
             let new_cap = instance_count.next_power_of_two().max(256);
-            self.quad_instance_buffers[slot] = Some(allocate_host_visible_buffer_raw(
+            buffers[slot] = Some(allocate_host_visible_buffer_raw(
                 &self.shared,
                 (new_cap * std::mem::size_of::<QuadInstance>()) as u64,
                 vk::BufferUsageFlags::VERTEX_BUFFER,
             ));
-            self.quad_instance_capacity[slot] = new_cap;
+            capacity[slot] = new_cap;
         }
-        let instance_buf = self.quad_instance_buffers[slot].as_ref().unwrap();
+        let instance_buf = buffers[slot].as_ref().unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(
                 instances.as_ptr() as *const u8,

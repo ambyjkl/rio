@@ -23,12 +23,6 @@ pub const FADE_OUT_DURATION_MS: u128 = 300;
 pub const SCROLLBAR_COLOR: [f32; 4] = [0.6, 0.6, 0.6, 0.5];
 pub const SCROLLBAR_DRAG_COLOR: [f32; 4] = [0.7, 0.7, 0.7, 0.7];
 
-// Depth / order for the terminal-surface scrollbar (render on top of
-// content but below overlays). Palette / other UIs pick their own
-// values via `draw_thumb`'s parameters.
-pub const TERMINAL_DEPTH: f32 = 0.0;
-pub const TERMINAL_ORDER: u8 = 5;
-
 /// Fade-in/out opacity for a scrollbar given the timestamp of the most
 /// recent scroll event (`None` = never scrolled). `dragging` pins it to
 /// fully opaque so a slow drag doesn't fade out under the user's cursor.
@@ -88,16 +82,24 @@ pub fn compute_thumb(
     Some((track_top + scrollable * progress, thumb_height))
 }
 
-/// Paint a single scrollbar thumb — the one and only way rio renders a
-/// scrollbar. Uses `SCROLLBAR_COLOR` (or `SCROLLBAR_DRAG_COLOR` if
-/// `dragging`) modulated by `opacity`. `opacity <= 0.0` is a no-op so
-/// callers can pipe the fade helper straight in.
-///
-/// `depth` + `order` let callers place the thumb above their own
-/// background layers: the terminal uses `TERMINAL_DEPTH` /
-/// `TERMINAL_ORDER` so the bar lives on top of the cell content, the
-/// command palette uses a higher order so the bar isn't swallowed by
-/// the palette's backdrop/bg rects.
+/// Shared color policy for terminal and UI scrollbars. Fading changes
+/// only the thumb's alpha, not its geometry or the text underneath it.
+fn thumb_color(opacity: f32, dragging: bool) -> Option<[f32; 4]> {
+    if opacity <= 0.0 {
+        return None;
+    }
+    let base = if dragging {
+        SCROLLBAR_DRAG_COLOR
+    } else {
+        SCROLLBAR_COLOR
+    };
+    Some([base[0], base[1], base[2], base[3] * opacity])
+}
+
+/// Paint a scrollbar over a UI background, such as the command palette.
+/// UI labels have their own later text pass. Terminal thumbs instead use
+/// `rect_below_text` so the grid's glyphs retain their foreground colors.
+/// `depth` + `order` place this thumb above its UI's background layers.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_thumb(
     sugarloaf: &mut Sugarloaf,
@@ -109,16 +111,9 @@ pub fn draw_thumb(
     depth: f32,
     order: u8,
 ) {
-    if opacity <= 0.0 {
-        return;
+    if let Some(color) = thumb_color(opacity, dragging) {
+        sugarloaf.rect(None, x, y, SCROLLBAR_WIDTH, height, color, depth, order);
     }
-    let base = if dragging {
-        SCROLLBAR_DRAG_COLOR
-    } else {
-        SCROLLBAR_COLOR
-    };
-    let color = [base[0], base[1], base[2], base[3] * opacity];
-    sugarloaf.rect(None, x, y, SCROLLBAR_WIDTH, height, color, depth, order);
 }
 
 /// Computed geometry of a scrollbar track and thumb in logical pixels.
@@ -404,16 +399,18 @@ impl Scrollbar {
             .drag_state
             .is_some_and(|d| d.rich_text_id == rich_text_id);
 
-        draw_thumb(
-            sugarloaf,
-            geom.bar_x,
-            geom.thumb_y,
-            geom.thumb_height,
-            opacity,
-            is_dragging,
-            TERMINAL_DEPTH,
-            TERMINAL_ORDER,
-        );
+        // Keep the overlay inside the existing pane, but composite it after
+        // cell backgrounds and before glyphs. Painting the same gray thumb
+        // over text reduces glyph contrast and changes foreground colors.
+        if let Some(color) = thumb_color(opacity, is_dragging) {
+            sugarloaf.rect_below_text(
+                geom.bar_x,
+                geom.thumb_y,
+                SCROLLBAR_WIDTH,
+                geom.thumb_height,
+                color,
+            );
+        }
     }
 
     /// Test hook: direct access to the per-panel last-scroll timestamp
@@ -470,6 +467,29 @@ impl Scrollbar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumb_colors_and_fade_are_shared_with_ui_scrollbars() {
+        assert_eq!(thumb_color(1.0, false), Some(SCROLLBAR_COLOR));
+        assert_eq!(thumb_color(1.0, true), Some(SCROLLBAR_DRAG_COLOR));
+        assert_eq!(thumb_color(0.5, false), Some([0.6, 0.6, 0.6, 0.25]));
+        assert_eq!(thumb_color(0.5, true), Some([0.7, 0.7, 0.7, 0.35]));
+        assert_eq!(thumb_color(0.0, false), None);
+        assert_eq!(thumb_color(0.0, true), None);
+    }
+
+    #[test]
+    fn terminal_thumb_uses_existing_pane_width_without_a_gutter() {
+        let pane = [40.0, 70.0, 800.0, 400.0];
+        let scale = 2.0;
+        let margin = (2.0, 4.0);
+        let geom = Scrollbar::compute_thumb(pane, scale, 50, 100, 24, margin);
+        let pane_right = (pane[0] + margin.0 + pane[2]) / scale;
+        assert_eq!(geom.bar_x + SCROLLBAR_WIDTH, pane_right - SCROLLBAR_MARGIN);
+        assert_eq!(geom.bar_y, (pane[1] + margin.1) / scale + SCROLLBAR_MARGIN);
+        assert_eq!(geom.track_height, pane[3] / scale - SCROLLBAR_MARGIN * 2.0);
+        assert_eq!(SCROLLBAR_WIDTH, 6.0);
+    }
 
     #[test]
     fn opacity_zero_when_never_scrolled() {
