@@ -42,6 +42,15 @@ On Windows, the config file will be looked for in:
 
 	Default: _false_
 
+*enable-scroll-bar* = _true_ | _false_
+
+	Show a fading overlay scrollbar when scrolling terminal history.
+	The thumb is drawn over cell backgrounds but below terminal text,
+	keeping characters readable without reserving a gutter or reducing
+	the terminal's column count.
+
+	Default: _true_
+
 *env-vars* = [_"<string>"_,]
 
 	Environment variables to set for spawned processes.

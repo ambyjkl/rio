@@ -303,6 +303,7 @@ pub fn render_cpu(
 
     let vertices = renderer.vertices();
     let quad_instances = renderer.instances();
+    let below_text_instances = renderer.below_text_instances();
     let text_instances = text.instances();
 
     // Frame skip.
@@ -329,6 +330,7 @@ pub fn render_cpu(
         h.write(bytes);
         let inst_bytes: &[u8] = bytemuck::cast_slice(quad_instances);
         h.write(inst_bytes);
+        hash_below_text_rects(&mut h, below_text_instances);
         for (grid, uniforms) in grids.iter() {
             h.write(bytemuck::bytes_of(uniforms));
             if let crate::grid::GridRenderer::Cpu(cpu_grid) = &**grid {
@@ -427,25 +429,15 @@ pub fn render_cpu(
     // same way the GPU backends layer them: below-bg images first,
     // then cell backgrounds, below-text images, glyphs, above-text
     // images.
-    {
-        use crate::renderer::IMAGE_BG_LIMIT;
-        let buf_slice: &mut [u32] = &mut buffer;
-        let split_below_bg =
-            image_overlays.partition_point(|o| o.z_index < IMAGE_BG_LIMIT);
-        let split_below_text = image_overlays.partition_point(|o| o.z_index < 0);
-        let (below_bg, rest) = image_overlays.split_at(split_below_bg);
-        let (below_text, above_text) = rest.split_at(split_below_text - split_below_bg);
-
-        draw_image_overlays(buf_slice, buf_w, buf_h, below_bg, images.data);
-        for (grid, uniforms) in grids.iter() {
-            grid.render_bg_cpu(buf_slice, ctx.width_px, ctx.height_px, uniforms);
-        }
-        draw_image_overlays(buf_slice, buf_w, buf_h, below_text, images.data);
-        for (grid, uniforms) in grids.iter() {
-            grid.render_text_cpu(buf_slice, ctx.width_px, ctx.height_px, uniforms);
-        }
-        draw_image_overlays(buf_slice, buf_w, buf_h, above_text, images.data);
-    }
+    draw_grid_layers(
+        &mut buffer,
+        ctx.width_px,
+        ctx.height_px,
+        grids,
+        &image_overlays,
+        images,
+        below_text_instances,
+    );
 
     // QuadInstance pass: split borders, panel rects, scrollbar, dim
     // overlays — anything queued via `sugarloaf.rect/quad/rounded_rect`.
@@ -840,6 +832,57 @@ fn draw_glyph(
         for (d, &s) in dst_tail.iter_mut().zip(src_tail) {
             *d = blend_over_swar(s, *d);
         }
+    }
+}
+
+/// Compose terminal layers without a window/surface, shared by the CPU
+/// presenter and pixel-level regression tests.
+fn draw_grid_layers(
+    buf: &mut [u32],
+    width: u32,
+    height: u32,
+    grids: &[(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
+    image_overlays: &[&GraphicOverlay],
+    images: &ImageLayers<'_>,
+    below_text_instances: &[crate::renderer::batch::QuadInstance],
+) {
+    use crate::renderer::IMAGE_BG_LIMIT;
+    let buf_w = width as i32;
+    let buf_h = height as i32;
+    let split_below_bg = image_overlays.partition_point(|o| o.z_index < IMAGE_BG_LIMIT);
+    let split_below_text = image_overlays.partition_point(|o| o.z_index < 0);
+    let (below_bg, rest) = image_overlays.split_at(split_below_bg);
+    let (below_text, above_text) = rest.split_at(split_below_text - split_below_bg);
+
+    draw_image_overlays(buf, buf_w, buf_h, below_bg, images.data);
+    for (grid, uniforms) in grids {
+        grid.render_bg_cpu(buf, width, height, uniforms);
+    }
+    draw_image_overlays(buf, buf_w, buf_h, below_text, images.data);
+    draw_below_text_rects(buf, buf_w, buf_h, below_text_instances);
+    for (grid, uniforms) in grids {
+        grid.render_text_cpu(buf, width, height, uniforms);
+    }
+    draw_image_overlays(buf, buf_w, buf_h, above_text, images.data);
+}
+
+/// Include both the phase boundary and geometry/color in the repaint key.
+fn hash_below_text_rects(
+    h: &mut impl Hasher,
+    instances: &[crate::renderer::batch::QuadInstance],
+) {
+    h.write_usize(instances.len());
+    h.write(bytemuck::cast_slice(instances));
+}
+
+fn draw_below_text_rects(
+    buf: &mut [u32],
+    buf_w: i32,
+    buf_h: i32,
+    instances: &[crate::renderer::batch::QuadInstance],
+) {
+    for inst in instances {
+        draw_quad_instance(buf, buf_w, buf_h, inst);
     }
 }
 
@@ -1244,5 +1287,122 @@ mod image_overlay_tests {
         let image = vec![0u8; 2 * 2 * 4]; // all alpha 0
         draw_image_overlay(&mut buf, 2, 2, &overlay(0.0, 0.0, 2.0, 2.0), 2, 2, &image);
         assert!(buf.iter().all(|&px| px == 0x0012_3456));
+    }
+}
+
+#[cfg(test)]
+mod below_text_tests {
+    use super::*;
+    use crate::grid::{
+        cpu::CpuGridRenderer, CellBg, CellText, GlyphKey, GridRenderer, GridUniforms,
+        RasterizedGlyph,
+    };
+    use crate::renderer::batch::QuadInstance;
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn opaque_rect_covers_background_but_not_glyphs_or_later_ui() {
+        let mut cpu_grid = CpuGridRenderer::new(1, 1);
+        let slot = cpu_grid
+            .insert_glyph(
+                GlyphKey {
+                    font_id: 0,
+                    glyph_id: 1,
+                    size_bucket: 1,
+                },
+                RasterizedGlyph {
+                    width: 1,
+                    height: 1,
+                    bearing_x: 0,
+                    bearing_y: 1,
+                    bytes: &[255],
+                },
+            )
+            .unwrap();
+        cpu_grid.write_row(
+            0,
+            &[CellBg {
+                rgba: [0, 0, 255, 255],
+            }],
+            &[CellText {
+                glyph_pos: [slot.x as u32, slot.y as u32],
+                glyph_size: [1, 1],
+                bearings: [1, 1],
+                color: [255; 4],
+                ..CellText::default()
+            }],
+        );
+        let mut grid = GridRenderer::Cpu(cpu_grid);
+        let uniforms = GridUniforms {
+            cell_size: [3.0, 1.0],
+            grid_size: [1, 1],
+            ..GridUniforms::zeroed()
+        };
+        let overlays = FxHashMap::default();
+        let data = FxHashMap::default();
+        let images = ImageLayers {
+            overlays: &overlays,
+            data: &data,
+        };
+        let rect = QuadInstance::solid_rect(0.0, 0.0, 2.0, 1.0, [1.0, 0.0, 0.0, 1.0]);
+        let mut buf = vec![0; 3];
+        draw_grid_layers(
+            &mut buf,
+            3,
+            1,
+            &[(&mut grid, uniforms)],
+            &[],
+            &images,
+            &[rect],
+        );
+        assert_eq!(
+            buf,
+            [
+                pack_opaque(255, 0, 0),
+                pack_opaque(255, 255, 255),
+                pack_opaque(0, 0, 255)
+            ]
+        );
+
+        // The existing ordinary UI phase can still cover terminal glyphs.
+        let ui = QuadInstance::solid_rect(1.0, 0.0, 1.0, 1.0, [0.0, 1.0, 0.0, 1.0]);
+        draw_quad_instance(&mut buf, 3, 1, &ui);
+        assert_eq!(buf[1], pack_opaque(0, 255, 0));
+
+        // A subsequent frame with no rectangles restores cell backgrounds.
+        draw_grid_layers(&mut buf, 3, 1, &[(&mut grid, uniforms)], &[], &images, &[]);
+        assert_eq!(
+            buf,
+            [
+                pack_opaque(0, 0, 255),
+                pack_opaque(255, 255, 255),
+                pack_opaque(0, 0, 255)
+            ]
+        );
+    }
+
+    #[test]
+    fn repaint_hash_tracks_presence_geometry_color_and_order() {
+        fn hash(instances: &[QuadInstance]) -> u64 {
+            let mut h = rustc_hash::FxHasher::default();
+            hash_below_text_rects(&mut h, instances);
+            h.finish()
+        }
+        let rect = QuadInstance::solid_rect(1.0, 2.0, 3.0, 4.0, [1.0, 0.0, 0.0, 0.5]);
+        let base = hash(&[rect]);
+        assert_eq!(base, hash(&[rect]));
+        assert_ne!(base, hash(&[]));
+        for field in 0..5 {
+            let mut changed = rect;
+            match field {
+                0 => changed.pos[0] += 1.0,
+                1 => changed.pos[1] += 1.0,
+                2 => changed.size[0] += 1.0,
+                3 => changed.size[1] += 1.0,
+                _ => changed.color[3] = 1.0,
+            }
+            assert_ne!(base, hash(&[changed]));
+            assert_ne!(hash(&[rect, changed]), hash(&[changed, rect]));
+        }
     }
 }

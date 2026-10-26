@@ -38,6 +38,28 @@ pub struct QuadInstance {
     pub clip_rect: [f32; 4],    // [x, y, w, h] physical pixels (16)
 }
 
+impl QuadInstance {
+    /// A solid, unclipped rectangle in physical pixels.
+    pub(super) fn solid_rect(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: [f32; 4],
+    ) -> Self {
+        Self {
+            pos: [x, y, 0.0],
+            color,
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            layers: [0; 2],
+            size: [width, height],
+            corner_radii: [0.0; 4],
+            underline_style: 0,
+            clip_rect: [0.0; 4],
+        }
+    }
+}
+
 /// Vertex for non-quad geometry (lines, triangles, arcs).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Zeroable, Pod)]

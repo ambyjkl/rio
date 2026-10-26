@@ -76,6 +76,9 @@ pub enum RendererType {
 pub struct WgpuRenderer {
     vertex_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
+    // Separate storage: later UI uploads must not overwrite these draws.
+    below_text_instance_buffer: Option<wgpu::Buffer>,
+    below_text_instance_capacity: usize,
     constant_bind_group: wgpu::BindGroup,
     layout_bind_group: wgpu::BindGroup,
     layout_bind_group_layout: wgpu::BindGroupLayout,
@@ -835,6 +838,26 @@ pub struct BackgroundImagePixels {
     pub pixels: Vec<u8>,
 }
 
+/// Immediate-mode rectangles, consumed exactly once at frame preparation.
+/// Keep both allocations across frames, including empty and discarded frames.
+#[derive(Default)]
+struct BelowTextRects {
+    pending: Vec<batch::QuadInstance>,
+    current: Vec<batch::QuadInstance>,
+}
+
+impl BelowTextRects {
+    fn prepare(&mut self) {
+        self.current.clear();
+        std::mem::swap(&mut self.pending, &mut self.current);
+    }
+
+    fn discard(&mut self) {
+        self.pending.clear();
+        self.current.clear();
+    }
+}
+
 pub struct Renderer {
     /// Set when a frame could not be presented (drawable acquisition
     /// failed, e.g. right after sleep/wake). Consumed by the embedder via
@@ -843,6 +866,7 @@ pub struct Renderer {
     brush_type: RendererType,
     comp: Compositor,
     instances: Vec<batch::QuadInstance>,
+    below_text_rects: BelowTextRects,
     vertices: Vec<Vertex>,
     draw_cmds: Vec<batch::DrawCmd>,
     images: ImageCache,
@@ -1026,6 +1050,7 @@ impl Renderer {
             brush_type,
             comp: Compositor::new(),
             instances: vec![],
+            below_text_rects: BelowTextRects::default(),
             vertices: vec![],
             draw_cmds: vec![],
             images: ImageCache::new(context),
@@ -1051,6 +1076,7 @@ impl Renderer {
     #[inline]
     pub(crate) fn discard_frame_batches(&mut self) {
         self.comp.batches.reset();
+        self.below_text_rects.discard();
     }
 
     /// Replace the background image. Pass `None` to clear it. The pixels
@@ -1080,6 +1106,7 @@ impl Renderer {
             Vec<crate::sugarloaf::graphics::GraphicOverlay>,
         >,
     ) {
+        self.below_text_rects.prepare();
         self.instances.clear();
         self.vertices.clear();
         self.draw_cmds.clear();
@@ -1708,6 +1735,20 @@ impl Renderer {
         );
     }
 
+    /// Queue a physical-pixel rectangle for the phase between cell bg and text.
+    pub fn rect_below_text(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: [f32; 4],
+    ) {
+        self.below_text_rects
+            .pending
+            .push(batch::QuadInstance::solid_rect(x, y, width, height, color));
+    }
+
     /// Add a rounded rectangle with the specified border radius
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -1857,6 +1898,44 @@ impl Renderer {
             depth,
             &color,
         );
+    }
+
+    /// Draw after all grid backgrounds, before any grid glyphs. This uses a
+    /// dedicated lazy buffer, never the ordinary UI instance allocation.
+    #[cfg(feature = "wgpu")]
+    pub fn render_below_text_wgpu(
+        &mut self,
+        ctx: &WgpuContext,
+        rpass: &mut wgpu::RenderPass<'_>,
+    ) {
+        let instances = &self.below_text_rects.current;
+        if instances.is_empty() {
+            return;
+        }
+        let RendererType::Wgpu(brush) = &mut self.brush_type else {
+            return;
+        };
+        if instances.len() > brush.below_text_instance_capacity {
+            let capacity = instances.len().next_power_of_two();
+            brush.below_text_instance_buffer =
+                Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("sugarloaf::below-text rectangles"),
+                    size: (capacity * mem::size_of::<batch::QuadInstance>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            brush.below_text_instance_capacity = capacity;
+        }
+        let buffer = brush.below_text_instance_buffer.as_ref().unwrap();
+        ctx.queue
+            .write_buffer(buffer, 0, bytemuck::cast_slice(instances));
+        rpass.set_pipeline(&brush.instanced_pipeline);
+        rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
+        // Solid instances do not sample textures; the existing placeholder /
+        // atlas bindings still satisfy the shared pipeline layout.
+        rpass.set_bind_group(1, &brush.layout_bind_group, &[]);
+        rpass.set_vertex_buffer(0, buffer.slice(..));
+        rpass.draw(0..4, 0..instances.len() as u32);
     }
 
     #[inline]
@@ -2283,6 +2362,8 @@ impl Renderer {
             //   ↓
             //   kitty BG_LIMIT ≤ z < 0  (BelowText)
             //   ↓
+            //   below-text rectangles
+            //   ↓
             //   grid text pass (per panel)
             //   ↓
             //   kitty z >= 0  (AboveText)
@@ -2291,10 +2372,8 @@ impl Renderer {
             //   ↓
             //   UI text pass (labels)
             //
-            // The two grid passes run inside a single iteration loop
-            // per panel — for multi-panel layouts the bg/text
-            // ordering is per-grid (one panel's text doesn't paint
-            // over another panel's bg image, and vice versa).
+            // Complete every panel's backgrounds before below-text rectangles
+            // and glyphs, without changing grid geometry.
             let ok = ok
                 && (|| {
                     if has_images
@@ -2326,6 +2405,23 @@ impl Renderer {
                             &globals,
                         )
                     {
+                        return false;
+                    }
+                    if !brush.render(
+                        &self.below_text_rects.current,
+                        &[],
+                        &[batch::DrawCmd::Instanced {
+                            offset: 0,
+                            count: self.below_text_rects.current.len() as u32,
+                            color_layer: 0,
+                            mask_layer: 0,
+                        }],
+                        &self.images,
+                        render_encoder,
+                        context,
+                        &instance_buffer,
+                        &mut instance_offset,
+                    ) {
                         return false;
                     }
                     for (grid, uniforms) in grids.iter_mut() {
@@ -2465,6 +2561,22 @@ impl Renderer {
         });
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn render_below_text_vulkan(
+        &mut self,
+        cmd: ash::vk::CommandBuffer,
+        frame: &crate::context::vulkan::VulkanFrame,
+    ) {
+        if let RendererType::Vulkan(brush) = &mut self.brush_type {
+            brush.render_below_text(
+                cmd,
+                frame.slot,
+                [frame.extent.width as f32, frame.extent.height as f32],
+                &self.below_text_rects.current,
+            );
+        }
+    }
+
     /// Record sugarloaf's own draws inside the active dynamic-rendering
     /// pass that `Sugarloaf::render_vulkan` opens. Order:
     /// 1. Background image (full-screen quad).
@@ -2559,6 +2671,10 @@ impl Renderer {
     /// upload them to a per-instance vertex buffer; we just iterate.
     pub(crate) fn instances(&self) -> &[crate::renderer::batch::QuadInstance] {
         &self.instances
+    }
+
+    pub(crate) fn below_text_instances(&self) -> &[batch::QuadInstance] {
+        &self.below_text_rects.current
     }
 
     /// Image cache for CPU rasterizer atlas sampling.
@@ -3061,6 +3177,8 @@ impl WgpuRenderer {
             instanced_pipeline,
             vertex_buffer,
             instance_buffer,
+            below_text_instance_buffer: None,
+            below_text_instance_capacity: 0,
             supported_vertex_buffer,
             supported_instance_buffer,
             current_transform,
@@ -3191,6 +3309,73 @@ impl WgpuRenderer {
                 ],
                 label: Some("rich_text::Pipeline uniforms"),
             });
+    }
+}
+
+#[cfg(test)]
+mod below_text_tests {
+    use super::*;
+
+    fn rect(x: f32) -> batch::QuadInstance {
+        batch::QuadInstance::solid_rect(x, 2.0, 3.0, 4.0, [0.2, 0.4, 0.6, 1.0])
+    }
+
+    #[test]
+    fn preparation_consumes_pending_once_and_preserves_call_order() {
+        let mut rects = BelowTextRects::default();
+        rects.pending.extend([rect(1.0), rect(5.0)]);
+        assert!(rects.current.is_empty());
+        rects.prepare();
+        assert!(rects.pending.is_empty());
+        assert_eq!(
+            rects.current.iter().map(|r| r.pos[0]).collect::<Vec<_>>(),
+            [1.0, 5.0]
+        );
+        rects.pending.push(rect(9.0));
+        // Current frame stays immutable while the next frame is queued.
+        assert_eq!(rects.current.len(), 2);
+        rects.prepare();
+        assert_eq!(rects.current.len(), 1);
+        assert_eq!(rects.current[0].pos[0], 9.0);
+        rects.prepare();
+        assert!(rects.current.is_empty());
+        assert!(rects.pending.is_empty());
+    }
+
+    #[test]
+    fn discard_clears_both_pending_and_prepared_rectangles() {
+        let mut rects = BelowTextRects::default();
+        rects.pending.push(rect(1.0));
+        rects.prepare();
+        rects.pending.push(rect(2.0));
+        rects.discard();
+        assert!(rects.pending.is_empty());
+        assert!(rects.current.is_empty());
+        rects.prepare();
+        assert!(rects.current.is_empty());
+        rects.pending.push(rect(3.0));
+        rects.prepare();
+        assert_eq!(rects.current.len(), 1);
+        assert_eq!(rects.current[0].pos[0], 3.0);
+    }
+
+    #[test]
+    fn solid_rect_matches_existing_unclipped_rect_instances() {
+        let expected = rect(1.0);
+        let mut batches = batch::BatchManager::new();
+        batches.rect(
+            &batch::Rect::new(1.0, 2.0, 3.0, 4.0),
+            0.0,
+            &expected.color,
+            0,
+        );
+        let (mut instances, mut vertices, mut cmds) = (vec![], vec![], vec![]);
+        batches.build_display_list(&mut instances, &mut vertices, &mut cmds);
+        assert_eq!(
+            bytemuck::bytes_of(&expected),
+            bytemuck::bytes_of(&instances[0])
+        );
+        assert!(vertices.is_empty());
     }
 }
 
