@@ -2480,8 +2480,14 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     return;
                 }
 
-                let path = crate::platform::shell_escape(&path.to_string_lossy());
-                route.window.screen.paste(&(path + " "), true);
+                let Some(text) = crate::platform::dropped_file_text(&path) else {
+                    tracing::warn!(
+                        ?path,
+                        "Ignoring dropped path that cannot be safely inserted"
+                    );
+                    return;
+                };
+                route.window.screen.paste(&text, true);
             }
 
             WindowEvent::Resized(new_size) => {
