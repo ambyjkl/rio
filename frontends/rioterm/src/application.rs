@@ -8,7 +8,8 @@ use crate::watcher::configuration_file_updates;
 #[cfg(all(
     feature = "audio",
     not(target_os = "macos"),
-    not(target_os = "windows")
+    not(target_os = "windows"),
+    not(target_os = "linux")
 ))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use raw_window_handle::HasDisplayHandle;
@@ -133,7 +134,10 @@ impl Application<'_> {
             }
         }
 
-        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        #[cfg(target_os = "linux")]
+        crate::system_bell::ring();
+
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows"), not(target_os = "linux")))]
         {
             #[cfg(feature = "audio")]
             {
@@ -2416,7 +2420,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 #[cfg(all(
     feature = "audio",
     not(target_os = "macos"),
-    not(target_os = "windows")
+    not(target_os = "windows"),
+    not(target_os = "linux")
 ))]
 fn play_bell_sound() -> Result<(), Box<dyn Error>> {
     let host = cpal::default_host();
@@ -2437,7 +2442,8 @@ fn play_bell_sound() -> Result<(), Box<dyn Error>> {
 #[cfg(all(
     feature = "audio",
     not(target_os = "macos"),
-    not(target_os = "windows")
+    not(target_os = "windows"),
+    not(target_os = "linux")
 ))]
 fn run_bell<T>(
     device: &cpal::Device,
