@@ -557,6 +557,15 @@ impl Window {
         x11_or_wayland!(match self; Window(w) => w.focus_window())
     }
 
+    pub fn request_wayland_system_bell(&self) -> bool {
+        match self {
+            #[cfg(wayland_platform)]
+            Self::Wayland(window) => window.request_wayland_system_bell(),
+            #[cfg(x11_platform)]
+            Self::X(_) => false,
+        }
+    }
+
     pub fn request_user_attention(&self, request_type: Option<UserAttentionType>) {
         x11_or_wayland!(match self; Window(w) => w.request_user_attention(request_type))
     }
