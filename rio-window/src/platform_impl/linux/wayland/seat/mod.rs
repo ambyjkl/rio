@@ -204,9 +204,10 @@ impl SeatHandler for WinitState {
     fn new_seat(
         &mut self,
         _connection: &Connection,
-        _queue_handle: &QueueHandle<Self>,
+        queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
+        self.file_drop.add_seat(&seat, queue_handle);
         self.seats.insert(seat.id(), WinitSeatState::new());
     }
 
@@ -216,6 +217,7 @@ impl SeatHandler for WinitState {
         _queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
+        self.file_drop.remove_seat(&seat.id());
         let _ = self.seats.remove(&seat.id());
         self.on_keyboard_destroy(&seat.id());
     }

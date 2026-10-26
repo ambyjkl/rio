@@ -72,6 +72,19 @@ Rio supports many modern terminal features:
 - Font ligatures
 - Wide color gamut support
 
+# FILE DRAG AND DROP
+
+Drop local files or directories onto a terminal window to insert their paths
+into the active pane. Spaces and shell metacharacters are escaped, and each
+path is followed by a space. File contents are not pasted, and the drop does
+not press Enter or execute the pending command.
+
+Wayland file managers use the standard *text/uri-list* drag-and-drop format.
+Remote URLs are not treated as local paths. Paths containing control characters
+or names that cannot be represented as Unicode are ignored rather than injecting
+terminal keystrokes or silently changing the filename. Wayland drops exceeding
+4096 paths or a 1 MiB URI list are rejected.
+
 # ENVIRONMENT
 
 *RIO_CONFIG_HOME*

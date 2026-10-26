@@ -30,6 +30,7 @@ use sctk::shm::{Shm, ShmHandler};
 use sctk::subcompositor::SubcompositorState;
 
 use crate::platform_impl::wayland::event_loop::sink::EventSink;
+use crate::platform_impl::wayland::file_drop::FileDropState;
 use crate::platform_impl::wayland::output::MonitorHandle;
 use crate::platform_impl::wayland::seat::{
     PointerConstraintsState, RelativePointerState, TextInputState, WinitPointerData,
@@ -85,6 +86,9 @@ pub struct WinitState {
 
     /// The update for the `windows` coming from the compositor.
     pub window_compositor_updates: Vec<WindowCompositorUpdate>,
+
+    /// File drag-and-drop devices and asynchronous transfers (not clipboard state).
+    pub(super) file_drop: FileDropState,
 
     /// Currently handled seats.
     pub seats: AHashMap<ObjectId, WinitSeatState>,
@@ -200,8 +204,11 @@ impl WinitState {
 
         let seat_state = SeatState::new(globals, queue_handle);
 
+        let mut file_drop =
+            FileDropState::new(globals, queue_handle, loop_handle.clone());
         let mut seats = AHashMap::default();
         for seat in seat_state.seats() {
+            file_drop.add_seat(&seat, queue_handle);
             seats.insert(seat.id(), WinitSeatState::new());
         }
 
@@ -243,6 +250,7 @@ impl WinitState {
             .ok(),
 
             seats,
+            file_drop,
             text_input_state: TextInputState::new(globals, queue_handle).ok(),
 
             relative_pointer: RelativePointerState::new(globals, queue_handle).ok(),
