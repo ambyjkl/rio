@@ -118,7 +118,18 @@ impl Application<'_> {
         )
     }
 
-    fn handle_audio_bell(&mut self) {
+    fn handle_audio_bell(&mut self, window_id: rio_backend::event::WindowId) {
+        #[cfg(target_os = "linux")]
+        if self
+            .router
+            .routes
+            .get(&window_id)
+            .is_some_and(|route| route.window.winit_window.request_wayland_system_bell())
+        {
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = window_id;
         #[cfg(target_os = "macos")]
         {
             // Use system bell sound on macOS
@@ -142,7 +153,11 @@ impl Application<'_> {
         #[cfg(target_os = "linux")]
         crate::system_bell::ring();
 
-        #[cfg(all(not(target_os = "macos"), not(target_os = "windows"), not(target_os = "linux")))]
+        #[cfg(all(
+            not(target_os = "macos"),
+            not(target_os = "windows"),
+            not(target_os = "linux")
+        ))]
         {
             #[cfg(feature = "audio")]
             {
@@ -991,7 +1006,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             RioEventType::Rio(RioEvent::Bell(route_id)) => {
                 // Handle audio bell
                 if self.config.bell.audio {
-                    self.handle_audio_bell();
+                    self.handle_audio_bell(window_id);
                 }
 
                 if self.config.bell.tab_indicator {

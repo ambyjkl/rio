@@ -1403,6 +1403,23 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.has_focus())
     }
 
+    /// Requests the Wayland compositor system bell for this window without blocking.
+    ///
+    /// Returns `true` if the request was queued, or `false` if the protocol is
+    /// unavailable or the window is not on Wayland. A queued request does not
+    /// guarantee audible feedback: the compositor decides how to handle it.
+    /// Callers may use their own fallback when this returns `false`.
+    pub fn request_wayland_system_bell(&self) -> bool {
+        #[cfg(all(free_unix, not(redox)))]
+        {
+            self.window.request_wayland_system_bell()
+        }
+        #[cfg(not(all(free_unix, not(redox))))]
+        {
+            false
+        }
+    }
+
     /// Requests user attention to the window, this has no effect if the application
     /// is already focused. How requesting for user attention manifests is platform dependent,
     /// see [`UserAttentionType`] for details.
