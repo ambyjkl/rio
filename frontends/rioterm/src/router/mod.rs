@@ -967,6 +967,7 @@ impl<'a> RouteWindow<'a> {
         // invisible window as watched.
         let is_focused = winit_window.has_focus();
         screen.renderer.is_window_focused = is_focused;
+        screen.context_manager.initialize_window_focus(is_focused);
 
         Self {
             vblank_interval: monitor_vblank_interval,
