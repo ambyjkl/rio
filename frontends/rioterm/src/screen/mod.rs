@@ -3599,15 +3599,7 @@ impl Screen<'_> {
             self.mouse.left_button_state = ElementState::Released;
         }
 
-        if self.get_mode().contains(Mode::FOCUS_IN_OUT) {
-            let chr = if is_focused { "I" } else { "O" };
-
-            let msg = format!("\x1b[{chr}");
-            self.ctx_mut()
-                .current_mut()
-                .messenger
-                .send_write(msg.into_bytes());
-        }
+        self.context_manager.on_window_focus_change(is_focused);
     }
 
     #[inline]

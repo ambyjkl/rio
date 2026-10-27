@@ -14,7 +14,7 @@ use rio_backend::config::layout::Margin;
 use rio_backend::config::Shell;
 use smallvec::{smallvec, SmallVec};
 
-use rio_backend::crosswords::{Crosswords, MIN_COLUMNS, MIN_LINES};
+use rio_backend::crosswords::{Crosswords, Mode, MIN_COLUMNS, MIN_LINES};
 use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::event::EventListener;
 use rio_backend::event::WindowId;
@@ -136,11 +136,37 @@ pub struct ContextManager<T: EventListener> {
     contexts: SmallVec<[ContextGrid<T>; DEFAULT_CONTEXT_CAPACITY]>,
     current_index: usize,
     current_route: usize,
+    focus: PaneFocus,
     #[allow(unused)]
     capacity: usize,
     event_proxy: T,
     window_id: WindowId,
     pub config: ContextManagerConfig,
+}
+
+// Track logical focus independently of whether a pane has enabled reporting.
+#[derive(Default)]
+struct PaneFocus {
+    window_focused: bool,
+    route: Option<usize>,
+}
+
+impl PaneFocus {
+    fn transition(
+        &mut self,
+        window_focused: bool,
+        route: Option<usize>,
+    ) -> (Option<usize>, Option<usize>) {
+        let old = self.window_focused.then_some(self.route).flatten();
+        let new = window_focused.then_some(route).flatten();
+        self.window_focused = window_focused;
+        self.route = route;
+        if old == new {
+            (None, None)
+        } else {
+            (old, new)
+        }
+    }
 }
 
 /// Display name for the command a pane spawns: the configured program,
@@ -468,6 +494,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         let mut manager = ContextManager {
             current_index: 0,
             current_route: 0,
+            focus: PaneFocus::default(),
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 scaled_margin,
@@ -483,6 +510,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         // The native titlebar starts as the placeholder; one poke makes
         // it converge on the displayed title even for shells that never
         // emit an OSC title or OSC 7.
+        manager.current_route = manager.current().route_id;
+        manager.focus.route = Some(manager.current_route);
         manager.sync_window_title();
         Ok(manager)
     }
@@ -510,6 +539,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         Ok(ContextManager {
             current_index: 0,
             current_route: 0,
+            focus: PaneFocus::default(),
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 Margin::default(),
@@ -663,7 +693,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.sync_current_route();
             return;
         }
-        self.switch_to_next();
+        if self.config.is_native {
+            self.switch_to_next();
+            return;
+        }
+        self.current_index = (self.current_index + 1) % self.contexts.len();
         // Make sure first split is selected - get the root key
         let current_tab = &mut self.contexts[self.current_index];
         if let Some(root) = current_tab.root {
@@ -678,7 +712,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.sync_current_route();
             return;
         }
-        self.switch_to_prev();
+        if self.config.is_native {
+            self.switch_to_prev();
+            return;
+        }
+        self.current_index =
+            (self.current_index + self.contexts.len() - 1) % self.contexts.len();
         // Make sure last split is selected - get the last key in order
         let current_tab = &mut self.contexts[self.current_index];
         let ordered_keys = current_tab.get_ordered_keys();
@@ -996,12 +1035,45 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .send_event(RioEvent::SyncWindowTitle, self.window_id);
     }
 
+    fn report_focus(&mut self, route: usize, focused: bool) {
+        if let Some(item) = self.get_by_route_id(route) {
+            let context = item.context_mut();
+            let enabled = context.terminal.lock().mode().contains(Mode::FOCUS_IN_OUT);
+            if enabled {
+                context
+                    .messenger
+                    .send_write(if focused { b"\x1b[I" } else { b"\x1b[O" }.to_vec());
+            }
+        }
+    }
+
+    fn update_pane_focus(&mut self, window_focused: bool, route: Option<usize>) {
+        let (old, new) = self.focus.transition(window_focused, route);
+        if let Some(route) = old {
+            self.report_focus(route, false);
+        }
+        if let Some(route) = new {
+            self.report_focus(route, true);
+        }
+    }
+
+    // Initialize from the native window without inventing a focus event.
+    pub fn initialize_window_focus(&mut self, focused: bool) {
+        self.focus.window_focused = focused;
+        self.focus.route = Some(self.current().route_id);
+    }
+
+    pub fn on_window_focus_change(&mut self, focused: bool) {
+        self.update_pane_focus(focused, Some(self.current().route_id));
+    }
+
     /// Point `current_route` at the pane the user now sees and poke the
     /// titlebar. Every displayed-pane change (tab switch, split
     /// selection, split death, new splits) funnels here so the titlebar
     /// can never be left showing a pane that is not on screen.
     fn sync_current_route(&mut self) {
         self.current_route = self.current().route_id;
+        self.update_pane_focus(self.focus.window_focused, Some(self.current_route));
         if self.current().title_dirty {
             let template = self.config.title.content.clone();
             let context = self.contexts[self.current_index].current_mut();
@@ -1045,6 +1117,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn remove_current_grid(&mut self, sugarloaf: &mut Sugarloaf) {
+        if self.current_grid_len() <= 1 {
+            return;
+        }
+        self.update_pane_focus(self.focus.window_focused, None);
         self.contexts[self.current_index].remove_current(sugarloaf);
         self.sync_current_route();
     }
@@ -1095,6 +1171,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return;
         }
 
+        self.update_pane_focus(self.focus.window_focused, None);
         let index_to_remove = self.current_index;
         let mut should_set_current = false;
         if index_to_remove > 1 {
@@ -1256,15 +1333,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             &cloned_config,
         ) {
             Ok(new_context) => {
-                let new_route_id = new_context.route_id;
                 if split_down {
                     self.contexts[self.current_index].split_down(new_context, sugarloaf);
                 } else {
                     self.contexts[self.current_index].split_right(new_context, sugarloaf);
                 }
 
-                self.current_route = new_route_id;
-                self.sync_window_title();
+                self.sync_current_route();
             }
             Err(..) => {
                 tracing::error!("not able to create a new context");
@@ -1320,15 +1395,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             &context_manager_config,
         ) {
             Ok(new_context) => {
-                let new_route_id = new_context.route_id;
                 if split_down {
                     self.contexts[self.current_index].split_down(new_context, sugarloaf);
                 } else {
                     self.contexts[self.current_index].split_right(new_context, sugarloaf);
                 }
 
-                self.current_route = new_route_id;
-                self.sync_window_title();
+                self.sync_current_route();
             }
             Err(..) => {
                 tracing::error!("not able to create a new context");
@@ -1480,6 +1553,73 @@ pub fn process_open_url(
 pub mod test {
     use super::*;
     use crate::event::VoidListener;
+
+    #[test]
+    fn pane_focus_transitions_are_effective_window_focus() {
+        let mut focus = super::PaneFocus::default();
+        // Initial background selection and navigation never produce reports.
+        assert_eq!(focus.transition(false, Some(1)), (None, None));
+        assert_eq!(focus.transition(false, Some(2)), (None, None));
+        assert_eq!(focus.transition(true, Some(2)), (None, Some(2)));
+        assert_eq!(focus.transition(true, Some(2)), (None, None));
+        assert_eq!(focus.transition(true, Some(3)), (Some(2), Some(3)));
+        assert_eq!(focus.transition(false, Some(3)), (Some(3), None));
+        assert_eq!(focus.transition(false, Some(1)), (None, None));
+        assert_eq!(focus.transition(true, Some(1)), (None, Some(1)));
+        // Removal and its replacement produce out before in.
+        assert_eq!(focus.transition(true, None), (Some(1), None));
+        assert_eq!(focus.transition(true, Some(3)), (None, Some(3)));
+    }
+
+    #[test]
+    fn tab_focus_reports_respect_each_terminal_mode_and_window_focus() {
+        use crate::ansi::mode::PrivateMode;
+        use crate::performer::handler::Handler;
+        let mut cm =
+            ContextManager::start_with_capacity(3, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        let (tx1, rx1) = corcovado::channel::channel();
+        cm.current_mut().messenger = Messenger::new(tx1);
+        cm.current()
+            .terminal
+            .lock()
+            .set_private_mode(PrivateMode::new(1004));
+        cm.initialize_window_focus(false);
+        cm.add_context(false, 0);
+        let (tx2, rx2) = corcovado::channel::channel();
+        cm.contexts[1].current_mut().messenger = Messenger::new(tx2);
+        cm.set_current(1);
+        assert!(rx1.try_recv().is_err());
+        assert!(rx2.try_recv().is_err());
+        cm.on_window_focus_change(true); // second pane has reporting disabled
+        assert!(rx2.try_recv().is_err());
+        cm.set_current(0);
+        assert!(rx2.try_recv().is_err());
+        assert!(
+            matches!(rx1.try_recv(), Ok(Msg::Input(bytes)) if bytes.as_ref() == b"\x1b[I")
+        );
+        cm.set_current(0);
+        cm.on_window_focus_change(true);
+        assert!(rx1.try_recv().is_err());
+        cm.contexts[1]
+            .current()
+            .terminal
+            .lock()
+            .set_private_mode(PrivateMode::new(1004));
+        cm.set_current(1);
+        assert!(
+            matches!(rx1.try_recv(), Ok(Msg::Input(bytes)) if bytes.as_ref() == b"\x1b[O")
+        );
+        assert!(
+            matches!(rx2.try_recv(), Ok(Msg::Input(bytes)) if bytes.as_ref() == b"\x1b[I")
+        );
+        cm.on_window_focus_change(false);
+        assert!(
+            matches!(rx2.try_recv(), Ok(Msg::Input(bytes)) if bytes.as_ref() == b"\x1b[O")
+        );
+        cm.set_current(0);
+        assert!(rx1.try_recv().is_err());
+    }
 
     #[test]
     fn test_capacity() {
