@@ -1,7 +1,7 @@
 //! The event-loop routines.
 
 use std::cell::{Cell, RefCell};
-use std::io::Result as IOResult;
+use std::io::{self, Result as IOResult};
 use std::marker::PhantomData;
 use std::mem;
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
@@ -10,8 +10,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sctk::reexports::calloop::Error as CalloopError;
+use sctk::reexports::calloop::{Error as CalloopError, LoopHandle, RegistrationToken};
 use sctk::reexports::calloop_wayland_source::WaylandSource;
+use sctk::reexports::client::backend::WaylandError as WireError;
 use sctk::reexports::client::{globals, Connection, QueueHandle};
 
 use crate::cursor::OnlyCursorImage;
@@ -37,10 +38,121 @@ use sink::EventSink;
 
 use super::state::{WindowCompositorUpdate, WinitState};
 use super::window::state::FrameCallbackState;
-use super::{logical_to_physical_rounded, DeviceId, WaylandError, WindowId};
+use super::{
+    bump_connection_generation, logical_to_physical_rounded, DeviceId, WaylandError,
+    WindowId,
+};
 
 type WaylandDispatcher =
     calloop::Dispatcher<'static, WaylandSource<WinitState>, WinitState>;
+
+/// How long to wait before the first reconnect attempt after the display got lost.
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The cap of the exponentially growing delay between reconnect attempts.
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+/// For how long to try reconnecting before giving up and exiting the event loop.
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A connection which dies again sooner than that after being restored is considered unstable.
+const RECONNECT_STABLE_AFTER: Duration = Duration::from_secs(5);
+
+/// How many unstable connections in a row we are willing to go through.
+const RECONNECT_MAX_RAPID_LOSSES: u32 = 5;
+
+/// The smallest poll timeout while waiting for the display, to not spin on `ControlFlow::Poll`.
+const RECONNECT_MIN_POLL: Duration = Duration::from_millis(5);
+
+macro_rules! map_err {
+    ($e:expr, $err:expr) => {
+        $e.map_err(|error| os_error!($err(error).into()))
+    };
+}
+
+/// Everything which is bound to a single Wayland connection.
+struct Link {
+    connection: Connection,
+    queue_handle: QueueHandle<WinitState>,
+    winit_state: WinitState,
+    dispatcher: WaylandDispatcher,
+}
+
+/// Connect to the compositor (re-reading the environment) and bind all the globals.
+///
+/// Nothing is registered in the event loop yet, so a failure leaves no trace behind.
+fn establish(loop_handle: &LoopHandle<'static, WinitState>) -> Result<Link, RootOsError> {
+    let connection = map_err!(Connection::connect_to_env(), WaylandError::Connection)?;
+
+    let (globals, mut event_queue) = map_err!(
+        globals::registry_queue_init(&connection),
+        WaylandError::Global
+    )?;
+    let queue_handle = event_queue.handle();
+
+    let mut winit_state = WinitState::new(&globals, &queue_handle, loop_handle.clone())
+        .map_err(|error| os_error!(error))?;
+
+    // NOTE: do a roundtrip after binding the globals to prevent potential
+    // races with the server.
+    map_err!(
+        event_queue.roundtrip(&mut winit_state),
+        WaylandError::Dispatch
+    )?;
+
+    // Prepare the Wayland source.
+    let wayland_source = WaylandSource::new(connection.clone(), event_queue);
+    let dispatcher = calloop::Dispatcher::new(
+        wayland_source,
+        |_, queue, winit_state: &mut WinitState| {
+            let result = queue.dispatch_pending(winit_state);
+            if result.is_ok()
+                && (!winit_state.events_sink.is_empty()
+                    || !winit_state.window_compositor_updates.is_empty())
+            {
+                winit_state.dispatched_events = true;
+            }
+            result
+        },
+    );
+
+    Ok(Link {
+        connection,
+        queue_handle,
+        winit_state,
+        dispatcher,
+    })
+}
+
+/// Whether an error from the wire means that the connection can't be used anymore.
+fn is_fatal_wire_error(error: &WireError) -> bool {
+    match error {
+        WireError::Io(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ),
+        WireError::Protocol(_) => true,
+    }
+}
+
+/// A display event to deliver to the application from the next loop iteration.
+#[derive(Debug, Clone, Copy)]
+enum DisplayEvent {
+    Lost,
+    Restored,
+}
+
+/// The state of the attempts to get the display back.
+struct Reconnect {
+    /// When to stop trying and exit.
+    deadline: Instant,
+
+    /// When to try the next time.
+    next_attempt: Instant,
+
+    /// The current delay between the attempts.
+    backoff: Duration,
+}
 
 /// The Wayland event loop.
 pub struct EventLoop<T: 'static> {
@@ -59,12 +171,17 @@ pub struct EventLoop<T: 'static> {
     /// Pending events from the user.
     pending_user_events: Rc<RefCell<Vec<T>>>,
 
-    /// The Wayland dispatcher to has raw access to the queue when needed, such as
-    /// when creating a new window.
-    wayland_dispatcher: WaylandDispatcher,
+    /// Display events (lost/restored) waiting to be delivered to the application.
+    pending_display_events: Vec<DisplayEvent>,
 
-    /// Connection to the wayland server.
-    connection: Connection,
+    /// Set while the display is lost and we're trying to get it back.
+    reconnect: Option<Reconnect>,
+
+    /// When the display was last restored.
+    last_restore: Option<Instant>,
+
+    /// How many connections in a row died shortly after being restored.
+    rapid_losses: u32,
 
     /// Event loop window target.
     window_target: RootActiveEventLoop,
@@ -76,54 +193,20 @@ pub struct EventLoop<T: 'static> {
 
 impl<T: 'static> EventLoop<T> {
     pub fn new() -> Result<EventLoop<T>, EventLoopError> {
-        macro_rules! map_err {
-            ($e:expr, $err:expr) => {
-                $e.map_err(|error| os_error!($err(error).into()))
-            };
-        }
-
-        let connection =
-            map_err!(Connection::connect_to_env(), WaylandError::Connection)?;
-
-        let (globals, mut event_queue) = map_err!(
-            globals::registry_queue_init(&connection),
-            WaylandError::Global
-        )?;
-        let queue_handle = event_queue.handle();
-
         let event_loop = map_err!(
             calloop::EventLoop::<WinitState>::try_new(),
             WaylandError::Calloop
         )?;
 
-        let mut winit_state =
-            WinitState::new(&globals, &queue_handle, event_loop.handle())
-                .map_err(|error| os_error!(error))?;
-
-        // NOTE: do a roundtrip after binding the globals to prevent potential
-        // races with the server.
-        map_err!(
-            event_queue.roundtrip(&mut winit_state),
-            WaylandError::Dispatch
-        )?;
+        let Link {
+            connection,
+            queue_handle,
+            winit_state,
+            dispatcher: wayland_dispatcher,
+        } = establish(&event_loop.handle())?;
 
         // Register Wayland source.
-        let wayland_source = WaylandSource::new(connection.clone(), event_queue);
-        let wayland_dispatcher = calloop::Dispatcher::new(
-            wayland_source,
-            |_, queue, winit_state: &mut WinitState| {
-                let result = queue.dispatch_pending(winit_state);
-                if result.is_ok()
-                    && (!winit_state.events_sink.is_empty()
-                        || !winit_state.window_compositor_updates.is_empty())
-                {
-                    winit_state.dispatched_events = true;
-                }
-                result
-            },
-        );
-
-        map_err!(
+        let dispatcher_token = map_err!(
             event_loop
                 .handle()
                 .register_dispatcher(wayland_dispatcher.clone()),
@@ -169,8 +252,11 @@ impl<T: 'static> EventLoop<T> {
         map_err!(result, WaylandError::Calloop)?;
 
         let window_target = ActiveEventLoop {
-            connection: connection.clone(),
-            wayland_dispatcher: wayland_dispatcher.clone(),
+            connection: Some(connection),
+            wayland_dispatcher: Some(wayland_dispatcher),
+            dispatcher_token: Some(dispatcher_token),
+            retired_connection: None,
+            display_lost: Cell::new(false),
             event_loop_awakener,
             queue_handle,
             control_flow: Cell::new(ControlFlow::default()),
@@ -183,8 +269,10 @@ impl<T: 'static> EventLoop<T> {
             compositor_updates: Vec::new(),
             buffer_sink: EventSink::default(),
             window_ids: Vec::new(),
-            connection,
-            wayland_dispatcher,
+            pending_display_events: Vec::new(),
+            reconnect: None,
+            last_restore: None,
+            rapid_losses: 0,
             user_events_sender,
             pending_user_events,
             event_loop,
@@ -276,28 +364,69 @@ impl<T: 'static> EventLoop<T> {
                 min_timeout(control_flow_timeout, timeout)
             };
 
+            // While the display is lost we keep the loop going (user events, timers) and
+            // try to reconnect once in a while. Otherwise flush the requests.
+            //
             // NOTE Ideally we should flush as the last thing we do before polling
             // to wait for events, and this should be done by the calloop
             // WaylandSource but we currently need to flush writes manually.
             //
-            // Checking for flush error is essential to perform an exit with error, since
-            // once we have a protocol error, we could get stuck retrying...
-            if self.connection.flush().is_err() {
-                self.set_exit_code(1);
-                return;
+            // Checking for flush error is essential, since once we have a protocol error,
+            // we could get stuck retrying...
+            let mut skip_dispatch = false;
+            let mut dispatch_timeout = timeout;
+            if self.is_display_lost() {
+                self.drive_reconnect();
+                if self.exit_code().is_some() {
+                    return;
+                }
+
+                if self.is_display_lost() {
+                    // Don't sleep past the next attempt, and don't spin on `Poll`.
+                    let reconnect = self.reconnect.as_ref().unwrap();
+                    let until_next = reconnect
+                        .next_attempt
+                        .saturating_duration_since(Instant::now());
+                    dispatch_timeout = min_timeout(timeout, Some(until_next))
+                        .map(|timeout| timeout.max(RECONNECT_MIN_POLL));
+                } else {
+                    // Restored, tell the application right away.
+                    skip_dispatch = true;
+                }
+            } else if let Some(Err(error)) =
+                self.connection().map(|connection| connection.flush())
+            {
+                if is_fatal_wire_error(&error) {
+                    self.handle_display_lost(&error);
+                    skip_dispatch = true;
+                    if self.exit_code().is_some() {
+                        // Too many unstable connections in a row.
+                        return;
+                    }
+                }
             }
 
-            if let Err(error) = self.loop_dispatch(timeout) {
-                // NOTE We exit on errors from dispatches, since if we've got protocol error
-                // libwayland-client/wayland-rs will inform us anyway, but crashing downstream is
-                // not really an option. Instead we inform that the event loop got
-                // destroyed. We may communicate an error that something was
-                // terminated, but winit doesn't provide us with an API to do that
-                // via some event. Still, we set the exit code to the error's OS
-                // error code, or to 1 if not possible.
-                let exit_code = error.raw_os_error().unwrap_or(1);
-                self.set_exit_code(exit_code);
-                return;
+            if !skip_dispatch {
+                if let Err(error) = self.loop_dispatch(dispatch_timeout) {
+                    if !self.is_display_lost() && self.is_disconnect_error(&error) {
+                        // The compositor went away, try to get a new one instead of exiting.
+                        self.handle_display_lost(&error);
+                        if self.exit_code().is_some() {
+                            return;
+                        }
+                    } else {
+                        // NOTE We exit on other errors from dispatches, since if we've got
+                        // protocol error libwayland-client/wayland-rs will inform us anyway,
+                        // but crashing downstream is not really an option. Instead we inform
+                        // that the event loop got destroyed. We may communicate an error that
+                        // something was terminated, but winit doesn't provide us with an API
+                        // to do that via some event. Still, we set the exit code to the
+                        // error's OS error code, or to 1 if not possible.
+                        let exit_code = error.raw_os_error().unwrap_or(1);
+                        self.set_exit_code(exit_code);
+                        return;
+                    }
+                }
             }
 
             // NB: `StartCause::Init` is handled as a special case and doesn't need
@@ -324,7 +453,8 @@ impl<T: 'static> EventLoop<T> {
             };
 
             // Reduce spurious wake-ups.
-            let dispatched_events = self.with_state(|state| state.dispatched_events);
+            let dispatched_events = self.with_state(|state| state.dispatched_events)
+                || !self.pending_display_events.is_empty();
             if matches!(cause, StartCause::WaitCancelled { .. }) && !dispatched_events {
                 continue;
             }
@@ -361,6 +491,21 @@ impl<T: 'static> EventLoop<T> {
         // user events indirectly via callback to the user.
         for user_event in self.pending_user_events.borrow_mut().drain(..) {
             callback(Event::UserEvent(user_event), &self.window_target);
+        }
+
+        // Tell the application about the display going away/coming back.
+        for display_event in mem::take(&mut self.pending_display_events) {
+            match display_event {
+                DisplayEvent::Lost => {
+                    callback(Event::DisplayLost, &self.window_target);
+                }
+                DisplayEvent::Restored => {
+                    callback(Event::DisplayRestored, &self.window_target);
+                    // The application had its chance to release what it built on the old
+                    // connection, so it can finally go.
+                    self.wayland_target().retired_connection = None;
+                }
+            }
         }
 
         // Drain the pending compositor updates.
@@ -660,21 +805,214 @@ impl<T: 'static> EventLoop<T> {
     }
 
     fn roundtrip(&mut self) -> Result<usize, RootOsError> {
-        let state = match &mut self.window_target.p {
-            PlatformActiveEventLoop::Wayland(window_target) => {
-                window_target.state.get_mut()
-            }
+        let window_target = match &mut self.window_target.p {
+            PlatformActiveEventLoop::Wayland(window_target) => window_target,
             #[cfg(feature = "x11")]
             _ => unreachable!(),
         };
 
-        let mut wayland_source = self.wayland_dispatcher.as_source_mut();
+        // Nothing to flush to when the display is lost.
+        let Some(wayland_dispatcher) = window_target.wayland_dispatcher.as_ref() else {
+            return Ok(0);
+        };
+
+        let state = window_target.state.get_mut();
+        let mut wayland_source = wayland_dispatcher.as_source_mut();
         let event_queue = wayland_source.queue();
         event_queue.roundtrip(state).map_err(|error| {
             os_error!(OsError::WaylandError(Arc::new(WaylandError::Dispatch(
                 error
             ))))
         })
+    }
+
+    fn wayland_target(&mut self) -> &mut ActiveEventLoop {
+        match &mut self.window_target.p {
+            PlatformActiveEventLoop::Wayland(window_target) => window_target,
+            #[cfg(x11_platform)]
+            PlatformActiveEventLoop::X(_) => unreachable!(),
+        }
+    }
+
+    fn connection(&self) -> Option<&Connection> {
+        match &self.window_target.p {
+            PlatformActiveEventLoop::Wayland(window_target) => window_target.connection(),
+            #[cfg(x11_platform)]
+            PlatformActiveEventLoop::X(_) => unreachable!(),
+        }
+    }
+
+    fn is_display_lost(&self) -> bool {
+        match &self.window_target.p {
+            PlatformActiveEventLoop::Wayland(window_target) => {
+                window_target.is_display_lost()
+            }
+            #[cfg(x11_platform)]
+            PlatformActiveEventLoop::X(_) => unreachable!(),
+        }
+    }
+
+    /// Whether the error from dispatching the event loop is the compositor going away.
+    fn is_disconnect_error(&self, error: &io::Error) -> bool {
+        use io::ErrorKind::*;
+
+        if matches!(
+            error.kind(),
+            BrokenPipe
+                | ConnectionReset
+                | ConnectionAborted
+                | UnexpectedEof
+                | NotConnected
+        ) {
+            return true;
+        }
+
+        // Protocol errors are reported as `EPROTO` by the Wayland source.
+        if matches!(
+            error.raw_os_error(),
+            Some(
+                libc::EPIPE
+                    | libc::ECONNRESET
+                    | libc::ECONNABORTED
+                    | libc::ENOTCONN
+                    | libc::EPROTO
+            )
+        ) {
+            return true;
+        }
+
+        // Ask the connection itself, since the error could've been reported in a vague way.
+        match self.connection() {
+            Some(connection) => {
+                connection.protocol_error().is_some()
+                    || matches!(connection.flush(), Err(error) if is_fatal_wire_error(&error))
+            }
+            None => false,
+        }
+    }
+
+    /// Release everything that belongs to the dead connection and start looking for a new one.
+    ///
+    /// The old windows stay valid for the application, but are inert from now on.
+    fn handle_display_lost(&mut self, reason: &dyn std::fmt::Display) {
+        tracing::warn!("Lost the Wayland display ({reason}), trying to reconnect");
+
+        let now = Instant::now();
+        let rapid = self.last_restore.is_some_and(|restored| {
+            now.duration_since(restored) < RECONNECT_STABLE_AFTER
+        });
+        self.rapid_losses = if rapid { self.rapid_losses + 1 } else { 0 };
+
+        let loop_handle = self.event_loop.handle();
+        let window_target = self.wayland_target();
+        window_target.display_lost.set(true);
+
+        // Stop polling the dead socket, which also drops the event queue.
+        if let Some(token) = window_target.dispatcher_token.take() {
+            loop_handle.remove(token);
+        }
+        window_target.wayland_dispatcher = None;
+
+        // The application might still use the display pointer of the old windows until it
+        // handles `DisplayLost`/`DisplayRestored`, so don't free it before that.
+        window_target.retired_connection = window_target.connection.take();
+
+        // Drop all the state tied to the connection.
+        window_target.state.get_mut().display_lost();
+
+        self.pending_display_events.push(DisplayEvent::Lost);
+
+        if self.rapid_losses >= RECONNECT_MAX_RAPID_LOSSES {
+            tracing::error!("The Wayland display keeps getting lost, giving up");
+            self.reconnect = None;
+            self.set_exit_code(1);
+            return;
+        }
+
+        let backoff = if rapid {
+            RECONNECT_MAX_BACKOFF
+        } else {
+            RECONNECT_INITIAL_BACKOFF
+        };
+        self.reconnect = Some(Reconnect {
+            deadline: now + RECONNECT_TIMEOUT,
+            next_attempt: now + backoff,
+            backoff,
+        });
+    }
+
+    /// Try to reconnect when it's time to do so, or give up when it takes too long.
+    fn drive_reconnect(&mut self) {
+        let Some(reconnect) = self.reconnect.as_ref() else {
+            return;
+        };
+
+        let now = Instant::now();
+        if now >= reconnect.deadline {
+            tracing::error!("Timed out waiting for the Wayland display to come back");
+            self.reconnect = None;
+            self.set_exit_code(1);
+            return;
+        }
+
+        if now < reconnect.next_attempt {
+            return;
+        }
+
+        match self.try_restore() {
+            Ok(()) => {
+                self.reconnect = None;
+                self.last_restore = Some(Instant::now());
+                self.pending_display_events.push(DisplayEvent::Restored);
+            }
+            Err(error) => {
+                tracing::debug!("Wayland reconnect attempt failed: {error}");
+                if let Some(reconnect) = self.reconnect.as_mut() {
+                    reconnect.backoff =
+                        (reconnect.backoff * 2).min(RECONNECT_MAX_BACKOFF);
+                    reconnect.next_attempt = Instant::now() + reconnect.backoff;
+                }
+            }
+        }
+    }
+
+    /// A single attempt to reconnect, which replaces everything the old connection had.
+    fn try_restore(&mut self) -> Result<(), RootOsError> {
+        let loop_handle = self.event_loop.handle();
+
+        let Link {
+            connection,
+            queue_handle,
+            mut winit_state,
+            dispatcher,
+        } = establish(&loop_handle)?;
+
+        let dispatcher_token = map_err!(
+            loop_handle.register_dispatcher(dispatcher.clone()),
+            WaylandError::Calloop
+        )?;
+
+        // Ids of the windows created from now on must differ from the previous ones.
+        bump_connection_generation();
+
+        let window_target = self.wayland_target();
+
+        // Carry over the bits of state that don't depend on the connection.
+        let old_state = window_target.state.get_mut();
+        winit_state.last_system_theme = old_state.last_system_theme;
+
+        // Replace the inert shell of the old state.
+        *old_state = winit_state;
+        old_state.dispatched_events = true;
+
+        window_target.connection = Some(connection);
+        window_target.queue_handle = queue_handle;
+        window_target.wayland_dispatcher = Some(dispatcher);
+        window_target.dispatcher_token = Some(dispatcher_token);
+        window_target.display_lost.set(false);
+
+        tracing::info!("Reconnected to the Wayland display");
+        Ok(())
     }
 
     fn control_flow(&self) -> ControlFlow {
@@ -711,6 +1049,8 @@ pub struct ActiveEventLoop {
     pub event_loop_awakener: calloop::ping::Ping,
 
     /// The main queue used by the event loop.
+    ///
+    /// Stale while the display is lost.
     pub queue_handle: QueueHandle<WinitState>,
 
     /// The application's latest control_flow state
@@ -721,16 +1061,46 @@ pub struct ActiveEventLoop {
 
     // TODO remove that RefCell once we can pass `&mut` in `Window::new`.
     /// Winit state.
+    ///
+    /// While the display is lost it's an inert shell.
     pub state: RefCell<WinitState>,
 
-    /// Dispatcher of Wayland events.
-    pub wayland_dispatcher: WaylandDispatcher,
+    /// Dispatcher of Wayland events, `None` while the display is lost.
+    pub(super) wayland_dispatcher: Option<WaylandDispatcher>,
 
-    /// Connection to the wayland server.
-    pub connection: Connection,
+    /// The token of the dispatcher in the calloop event loop.
+    pub(super) dispatcher_token: Option<RegistrationToken>,
+
+    /// Connection to the wayland server, `None` while the display is lost.
+    pub(super) connection: Option<Connection>,
+
+    /// The previous connection, kept alive until the application had a chance to release
+    /// everything it created using its display/surface pointers.
+    pub(super) retired_connection: Option<Connection>,
+
+    /// Whether the connection was lost and we're trying to get it back.
+    pub(super) display_lost: Cell<bool>,
 }
 
 impl ActiveEventLoop {
+    /// The current connection to the compositor, `None` while the display is lost.
+    #[inline]
+    pub(crate) fn connection(&self) -> Option<&Connection> {
+        self.connection.as_ref()
+    }
+
+    /// The dispatcher of the Wayland event queue, `None` while the display is lost.
+    #[inline]
+    pub(crate) fn wayland_dispatcher(&self) -> Option<&WaylandDispatcher> {
+        self.wayland_dispatcher.as_ref()
+    }
+
+    /// Whether the connection to the compositor is lost and we're trying to reconnect.
+    #[inline]
+    pub fn is_display_lost(&self) -> bool {
+        self.display_lost.get()
+    }
+
     pub(crate) fn set_control_flow(&self, control_flow: ControlFlow) {
         self.control_flow.set(control_flow)
     }
@@ -790,8 +1160,14 @@ impl ActiveEventLoop {
     ) -> Result<raw_window_handle::RawDisplayHandle, raw_window_handle::HandleError> {
         use sctk::reexports::client::Proxy;
 
+        // Always reflects the current connection, nothing while there's none.
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or(raw_window_handle::HandleError::Unavailable)?;
+
         Ok(raw_window_handle::WaylandDisplayHandle::new({
-            let ptr = self.connection.display().id().as_ptr();
+            let ptr = connection.display().id().as_ptr();
             std::ptr::NonNull::new(ptr as *mut _)
                 .expect("wl_display should never be null")
         })

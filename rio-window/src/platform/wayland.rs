@@ -24,12 +24,27 @@ pub use crate::window::Theme;
 pub trait ActiveEventLoopExtWayland {
     /// True if the [`ActiveEventLoop`] uses Wayland.
     fn is_wayland(&self) -> bool;
+
+    /// True while the connection to the Wayland compositor is lost and the event loop is
+    /// trying to reconnect (between [`ApplicationHandler::display_lost`] and
+    /// [`ApplicationHandler::display_restored`]). Window creation fails during that time.
+    ///
+    /// Always `false` when not using Wayland.
+    ///
+    /// [`ApplicationHandler::display_lost`]: crate::application::ApplicationHandler::display_lost
+    /// [`ApplicationHandler::display_restored`]: crate::application::ApplicationHandler::display_restored
+    fn is_display_lost(&self) -> bool;
 }
 
 impl ActiveEventLoopExtWayland for ActiveEventLoop {
     #[inline]
     fn is_wayland(&self) -> bool {
         self.p.is_wayland()
+    }
+
+    #[inline]
+    fn is_display_lost(&self) -> bool {
+        self.p.is_display_lost()
     }
 }
 

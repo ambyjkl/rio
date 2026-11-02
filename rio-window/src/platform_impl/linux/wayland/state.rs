@@ -150,6 +150,54 @@ pub struct WinitState {
 }
 
 impl WinitState {
+    /// Release everything that belongs to a connection which got lost.
+    ///
+    /// The state itself stays around as an inert shell, since it's the data type of the
+    /// calloop event loop that keeps running while we try to reconnect, and gets replaced
+    /// wholesale once a new connection is established.
+    ///
+    /// All the proxies dropped here belong to a dead (or already dropped) backend, which
+    /// makes their destructor requests no-ops.
+    pub fn display_lost(&mut self) {
+        // Layer-shell windows share their protocol objects between the
+        // surviving `Window` handle and the window state: flag them so
+        // dropping either side stays away from the dead display.
+        for window in self.windows.get_mut().values() {
+            if let Some(layer) = window.lock().unwrap().window.layer() {
+                layer.mark_lost();
+            }
+        }
+
+        // Flag the surviving `Window` handles, so they stop touching Wayland objects.
+        for requests in self.window_requests.get_mut().values() {
+            requests.lost.store(true, Ordering::Relaxed);
+        }
+
+        self.window_requests.get_mut().clear();
+        self.windows.get_mut().clear();
+        self.window_compositor_updates.clear();
+
+        // Old `Window`s keep pointing at the old sink/monitors, nothing observes them anymore.
+        self.events_sink = EventSink::new();
+        self.window_events_sink = Default::default();
+        self.monitors = Default::default();
+
+        // Dropping the keyboards also removes their key repeat timers from the loop.
+        self.seats.clear();
+        self.pointer_surfaces.clear();
+        self.text_input_state = None;
+        self.xdg_activation = None;
+        self.relative_pointer = None;
+        self.pointer_constraints = None;
+        self.viewporter_state = None;
+        self.fractional_scaling_manager = None;
+        self.kwin_blur_manager = None;
+        self.ext_background_effect_manager = None;
+
+        // Make sure the loop reports what happened.
+        self.dispatched_events = true;
+    }
+
     pub fn update_system_theme(&mut self) {
         let theme = crate::platform_impl::common::theme_monitor::get_cached_theme();
         if theme == self.last_system_theme {

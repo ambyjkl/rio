@@ -891,6 +891,18 @@ impl ActiveEventLoop {
         }
     }
 
+    /// Whether the connection to the display server is currently lost (Wayland only).
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_display_lost(&self) -> bool {
+        match *self {
+            #[cfg(wayland_platform)]
+            ActiveEventLoop::Wayland(ref evlp) => evlp.is_display_lost(),
+            #[cfg(x11_platform)]
+            _ => false,
+        }
+    }
+
     pub fn create_custom_cursor(&self, cursor: CustomCursorSource) -> CustomCursor {
         x11_or_wayland!(match self; ActiveEventLoop(evlp) => evlp.create_custom_cursor(cursor))
     }
@@ -959,7 +971,7 @@ impl ActiveEventLoop {
             #[cfg(x11_platform)]
             Self::X(conn) => OwnedDisplayHandle::X(conn.x_connection().clone()),
             #[cfg(wayland_platform)]
-            Self::Wayland(conn) => OwnedDisplayHandle::Wayland(conn.connection.clone()),
+            Self::Wayland(conn) => OwnedDisplayHandle::Wayland(conn.connection().cloned()),
         }
     }
 
@@ -987,8 +999,9 @@ impl ActiveEventLoop {
 pub(crate) enum OwnedDisplayHandle {
     #[cfg(x11_platform)]
     X(Arc<XConnection>),
+    /// `None` while the Wayland display is lost.
     #[cfg(wayland_platform)]
-    Wayland(wayland_client::Connection),
+    Wayland(Option<wayland_client::Connection>),
 }
 
 impl OwnedDisplayHandle {
@@ -1007,7 +1020,9 @@ impl OwnedDisplayHandle {
             .into()),
 
             #[cfg(wayland_platform)]
-            Self::Wayland(conn) => {
+            Self::Wayland(None) => Err(raw_window_handle::HandleError::Unavailable),
+            #[cfg(wayland_platform)]
+            Self::Wayland(Some(conn)) => {
                 use sctk::reexports::client::Proxy;
 
                 Ok(raw_window_handle::WaylandDisplayHandle::new(

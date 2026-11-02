@@ -707,5 +707,7 @@ pub(crate) fn dispatch_event_for_app<T: 'static, A: ApplicationHandler<T>>(
             app.hook_event(event_loop, &hook, &modifiers)
         }
         Event::OpenConfig => app.open_config(event_loop),
+        Event::DisplayLost => app.display_lost(event_loop),
+        Event::DisplayRestored => app.display_restored(event_loop),
     }
 }

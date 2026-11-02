@@ -9,6 +9,7 @@
 //! SCTK 0.19's LayerSurface owns and destroys its wl_surface on drop. Own the
 //! layer protocol object separately instead, so EGL/Vulkan/raw handles survive.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sctk::globals::ProvidesBoundGlobal;
@@ -64,6 +65,10 @@ pub struct LayerWindow {
     shell: ZwlrLayerShellV1,
     namespace: String,
     focus: bool,
+    /// The display connection this layer belonged to is gone (Wayland
+    /// compositor handover). Every protocol object is dead then: no
+    /// request is sent and the objects are released without destructors.
+    lost: AtomicBool,
     state: Mutex<LayerState>,
 }
 
@@ -92,6 +97,7 @@ impl LayerWindow {
             shell,
             namespace,
             focus,
+            lost: AtomicBool::new(false),
             state: Mutex::new(LayerState {
                 role: None,
                 size,
@@ -109,6 +115,9 @@ impl LayerWindow {
         qh: &QueueHandle<WinitState>,
         monitors: &[MonitorHandle],
     ) {
+        if self.is_lost() {
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         if let Some(role) = state.role.take() {
             role.destroy();
@@ -147,13 +156,31 @@ impl LayerWindow {
         state.role = Some(role);
     }
 
+    /// Mark the layer as belonging to a lost display connection, which
+    /// turns every operation into a no-op that does not touch the dead
+    /// protocol objects.
+    pub fn mark_lost(&self) {
+        self.lost.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
+
     pub fn set_output(&self, output: Option<WlOutput>) {
+        if self.is_lost() {
+            return;
+        }
         self.state.lock().unwrap().output = output;
     }
 
     pub fn set_size(&self, size: LogicalSize<u32>) {
         let mut state = self.state.lock().unwrap();
         state.size = LogicalSize::new(size.width.max(1), size.height.max(1));
+        if self.is_lost() {
+            return;
+        }
         if let Some(role) = &state.role {
             role.set_size(state.size.width, state.size.height);
         }
@@ -165,7 +192,11 @@ impl LayerWindow {
 
     pub fn destroy_role(&self) {
         if let Some(role) = self.state.lock().unwrap().role.take() {
-            role.destroy();
+            // Dropping a proxy sends nothing; only the destructor request
+            // would touch the (dead) connection.
+            if !self.is_lost() {
+                role.destroy();
+            }
         }
     }
 }
@@ -173,6 +204,8 @@ impl LayerWindow {
 impl Drop for LayerWindow {
     fn drop(&mut self) {
         self.destroy_role();
-        self.surface.destroy();
+        if !self.is_lost() {
+            self.surface.destroy();
+        }
     }
 }

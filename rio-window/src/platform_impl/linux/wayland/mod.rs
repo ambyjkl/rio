@@ -1,6 +1,7 @@
 //! Winit's Wayland backend.
 
 use std::fmt::Display;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use sctk::reexports::client::globals::{BindError, GlobalError};
@@ -72,10 +73,23 @@ impl DeviceId {
     }
 }
 
+/// Connection generation, bumped on every successful reconnect, so that [`WindowId`]s of
+/// windows created on a new connection never collide with ids of windows from an earlier
+/// one (the proxy addresses they're derived from can be reused by the allocator).
+static CONNECTION_GENERATION: AtomicU8 = AtomicU8::new(0);
+
+/// Start a new connection generation.
+fn bump_connection_generation() {
+    CONNECTION_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Get the WindowId out of the surface.
 #[inline]
 fn make_wid(surface: &WlSurface) -> WindowId {
-    WindowId(surface.id().as_ptr() as u64)
+    // User-space pointers fit well into the low 56 bits.
+    let address = surface.id().as_ptr() as u64 & 0x00ff_ffff_ffff_ffff;
+    let generation = CONNECTION_GENERATION.load(Ordering::Relaxed) as u64;
+    WindowId(address | (generation << 56))
 }
 
 /// The default routine does floor, but we need round on Wayland.

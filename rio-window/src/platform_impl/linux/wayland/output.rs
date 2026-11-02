@@ -11,11 +11,14 @@ use super::event_loop::ActiveEventLoop;
 impl ActiveEventLoop {
     #[inline]
     pub fn available_monitors(&self) -> impl Iterator<Item = MonitorHandle> {
-        self.state
-            .borrow()
-            .output_state
-            .outputs()
-            .map(MonitorHandle::new)
+        // The outputs of a lost display are gone.
+        let outputs: Vec<_> = if self.is_display_lost() {
+            Vec::new()
+        } else {
+            self.state.borrow().output_state.outputs().collect()
+        };
+
+        outputs.into_iter().map(MonitorHandle::new)
     }
 
     #[inline]

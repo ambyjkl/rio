@@ -114,6 +114,16 @@ pub enum Event<T: 'static> {
 
     OpenConfig,
     HookEvent(KeyEvent, Modifiers),
+
+    /// See [`ApplicationHandler::display_lost`] for details.
+    ///
+    /// [`ApplicationHandler::display_lost`]: crate::application::ApplicationHandler::display_lost
+    DisplayLost,
+
+    /// See [`ApplicationHandler::display_restored`] for details.
+    ///
+    /// [`ApplicationHandler::display_restored`]: crate::application::ApplicationHandler::display_restored
+    DisplayRestored,
 }
 
 impl<T> Event<T> {
@@ -133,6 +143,8 @@ impl<T> Event<T> {
             Opened { urls } => Ok(Opened { urls }),
             OpenConfig => Ok(OpenConfig),
             HookEvent(hook, modifiers) => Ok(HookEvent(hook, modifiers)),
+            DisplayLost => Ok(DisplayLost),
+            DisplayRestored => Ok(DisplayRestored),
         }
     }
 }

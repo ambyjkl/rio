@@ -90,6 +90,18 @@ impl Window {
         event_loop_window_target: &ActiveEventLoop,
         attributes: WindowAttributes,
     ) -> Result<Self, RootOsError> {
+        let (connection, wayland_dispatcher) = match (
+            event_loop_window_target.connection(),
+            event_loop_window_target.wayland_dispatcher(),
+        ) {
+            (Some(connection), Some(dispatcher)) => (connection, dispatcher),
+            _ => {
+                return Err(os_error!(OsError::Misc(
+                    "the Wayland display connection is lost"
+                )))
+            }
+        };
+
         let queue_handle = event_loop_window_target.queue_handle.clone();
         let mut state = event_loop_window_target.state.borrow_mut();
 
@@ -102,7 +114,7 @@ impl Window {
             .as_ref()
             .map(|activation_state| activation_state.global().clone());
         let system_bell = state.system_bell.clone();
-        let display = event_loop_window_target.connection.display();
+        let display = connection.display();
 
         let size: Size = attributes
             .inner_size
@@ -145,7 +157,7 @@ impl Window {
         };
 
         let mut window_state = WindowState::new(
-            event_loop_window_target.connection.clone(),
+            connection.clone(),
             &event_loop_window_target.queue_handle,
             &state,
             size,
@@ -229,6 +241,7 @@ impl Window {
         let window_requests = WindowRequests {
             redraw_requested: AtomicBool::new(true),
             closed: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
         };
         let window_requests = Arc::new(window_requests);
         state
@@ -239,8 +252,7 @@ impl Window {
         // Setup the event sync to insert `WindowEvents` right from the window.
         let window_events_sink = state.window_events_sink.clone();
 
-        let mut wayland_source =
-            event_loop_window_target.wayland_dispatcher.as_source_mut();
+        let mut wayland_source = wayland_dispatcher.as_source_mut();
         let event_queue = wayland_source.queue();
 
         // Do a roundtrip.
@@ -297,6 +309,12 @@ impl Window {
 }
 
 impl Window {
+    /// Whether the connection this window belongs to got lost, which makes the window inert.
+    #[inline]
+    fn is_lost(&self) -> bool {
+        self.window_requests.lost.load(Ordering::Relaxed)
+    }
+
     #[inline]
     pub fn id(&self) -> WindowId {
         self.window_id
@@ -304,12 +322,22 @@ impl Window {
 
     #[inline]
     pub fn set_title(&self, title: impl ToString) {
+        if self.is_lost() {
+            return;
+        }
+
         let new_title = title.to_string();
         self.window_state.lock().unwrap().set_title(new_title);
     }
 
     #[inline]
     pub fn set_visible(&self, visible: bool) {
+        // A lost window (including a layer-shell one) must neither remap a
+        // role nor commit on the dead display.
+        if self.is_lost() {
+            return;
+        }
+
         let mut state = self.window_state.lock().unwrap();
         if state.visible == visible && !(visible && state.layer_closed) {
             return;
@@ -387,6 +415,10 @@ impl Window {
 
     #[inline]
     pub fn request_redraw(&self) {
+        if self.is_lost() {
+            return;
+        }
+
         // NOTE: try to not wake up the loop when the event was already scheduled and not yet
         // processed by the loop, because if at this point the value was `true` it could only
         // mean that the loop still haven't dispatched the value to the client and will do
@@ -403,6 +435,10 @@ impl Window {
 
     #[inline]
     pub fn pre_present_notify(&self) {
+        if self.is_lost() {
+            return;
+        }
+
         self.window_state.lock().unwrap().request_frame_callback();
     }
 
@@ -415,6 +451,10 @@ impl Window {
 
     #[inline]
     pub fn request_inner_size(&self, size: Size) -> Option<PhysicalSize<u32>> {
+        if self.is_lost() {
+            return None;
+        }
+
         let mut window_state = self.window_state.lock().unwrap();
         let new_size = window_state.request_inner_size(size);
         self.request_redraw();
@@ -424,6 +464,10 @@ impl Window {
     /// Set the minimum inner size for the window.
     #[inline]
     pub fn set_min_inner_size(&self, min_size: Option<Size>) {
+        if self.is_lost() {
+            return;
+        }
+
         let scale_factor = self.scale_factor();
         let min_size = min_size.map(|size| size.to_logical(scale_factor));
         self.window_state
@@ -437,6 +481,10 @@ impl Window {
     /// Set the maximum inner size for the window.
     #[inline]
     pub fn set_max_inner_size(&self, max_size: Option<Size>) {
+        if self.is_lost() {
+            return;
+        }
+
         let scale_factor = self.scale_factor();
         let max_size = max_size.map(|size| size.to_logical(scale_factor));
         self.window_state
@@ -459,6 +507,10 @@ impl Window {
 
     #[inline]
     pub fn set_transparent(&self, transparent: bool) {
+        if self.is_lost() {
+            return;
+        }
+
         self.window_state
             .lock()
             .unwrap()
@@ -467,6 +519,10 @@ impl Window {
 
     #[inline]
     pub fn has_focus(&self) -> bool {
+        if self.is_lost() {
+            return false;
+        }
+
         self.window_state.lock().unwrap().has_focus()
     }
 
@@ -478,6 +534,10 @@ impl Window {
 
     #[inline]
     pub fn show_window_menu(&self, position: Position) {
+        if self.is_lost() {
+            return;
+        }
+
         let scale_factor = self.scale_factor();
         let position = position.to_logical(scale_factor);
         self.window_state.lock().unwrap().show_window_menu(position);
@@ -488,6 +548,10 @@ impl Window {
         &self,
         direction: ResizeDirection,
     ) -> Result<(), ExternalError> {
+        if self.is_lost() {
+            return Err(ExternalError::NotSupported(NotSupportedError::new()));
+        }
+
         self.window_state
             .lock()
             .unwrap()
@@ -496,6 +560,10 @@ impl Window {
 
     #[inline]
     pub fn set_resizable(&self, resizable: bool) {
+        if self.is_lost() {
+            return;
+        }
+
         if self.window_state.lock().unwrap().set_resizable(resizable) {
             // NOTE: Requires commit to be applied.
             self.request_redraw();
@@ -525,6 +593,10 @@ impl Window {
 
     #[inline]
     pub fn set_blur(&self, blur: crate::window::BlurStyle) {
+        if self.is_lost() {
+            return;
+        }
+
         self.window_state
             .lock()
             .unwrap()
@@ -533,6 +605,10 @@ impl Window {
 
     #[inline]
     pub fn set_decorations(&self, decorate: bool) {
+        if self.is_lost() {
+            return;
+        }
+
         self.window_state.lock().unwrap().set_decorate(decorate)
     }
 
@@ -549,6 +625,10 @@ impl Window {
 
     #[inline]
     pub fn set_minimized(&self, minimized: bool) {
+        if self.is_lost() {
+            return;
+        }
+
         // You can't unminimize the window on Wayland.
         if !minimized {
             warn!("Unminimizing is ignored on Wayland.");
@@ -573,6 +653,10 @@ impl Window {
 
     #[inline]
     pub fn set_maximized(&self, maximized: bool) {
+        if self.is_lost() {
+            return;
+        }
+
         if let Some(window) = self.window.xdg() {
             if maximized {
                 window.set_maximized()
@@ -604,6 +688,10 @@ impl Window {
 
     #[inline]
     pub(crate) fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
+        if self.is_lost() {
+            return;
+        }
+
         let Some(window) = self.window.xdg() else {
             return;
         };
@@ -627,6 +715,10 @@ impl Window {
 
     #[inline]
     pub fn set_cursor(&self, cursor: Cursor) {
+        if self.is_lost() {
+            return;
+        }
+
         let window_state = &mut self.window_state.lock().unwrap();
 
         match cursor {
@@ -637,6 +729,10 @@ impl Window {
 
     #[inline]
     pub fn set_cursor_visible(&self, visible: bool) {
+        if self.is_lost() {
+            return;
+        }
+
         self.window_state
             .lock()
             .unwrap()
@@ -654,6 +750,10 @@ impl Window {
     }
 
     pub fn request_user_attention(&self, request_type: Option<UserAttentionType>) {
+        if self.is_lost() {
+            return;
+        }
+
         let xdg_activation = match self.xdg_activation.as_ref() {
             Some(xdg_activation) => xdg_activation,
             None => {
@@ -683,6 +783,10 @@ impl Window {
     pub fn request_activation_token(
         &self,
     ) -> Result<AsyncRequestSerial, NotSupportedError> {
+        if self.is_lost() {
+            return Err(NotSupportedError::new());
+        }
+
         let xdg_activation = match self.xdg_activation.as_ref() {
             Some(xdg_activation) => xdg_activation,
             None => return Err(NotSupportedError::new()),
@@ -701,11 +805,19 @@ impl Window {
 
     #[inline]
     pub fn set_cursor_grab(&self, mode: CursorGrabMode) -> Result<(), ExternalError> {
+        if self.is_lost() {
+            return Err(ExternalError::NotSupported(NotSupportedError::new()));
+        }
+
         self.window_state.lock().unwrap().set_cursor_grab(mode)
     }
 
     #[inline]
     pub fn set_cursor_position(&self, position: Position) -> Result<(), ExternalError> {
+        if self.is_lost() {
+            return Err(ExternalError::NotSupported(NotSupportedError::new()));
+        }
+
         let scale_factor = self.scale_factor();
         let position = position.to_logical(scale_factor);
         self.window_state
@@ -718,11 +830,19 @@ impl Window {
 
     #[inline]
     pub fn drag_window(&self) -> Result<(), ExternalError> {
+        if self.is_lost() {
+            return Err(ExternalError::NotSupported(NotSupportedError::new()));
+        }
+
         self.window_state.lock().unwrap().drag_window()
     }
 
     #[inline]
     pub fn set_cursor_hittest(&self, hittest: bool) -> Result<(), ExternalError> {
+        if self.is_lost() {
+            return Err(ExternalError::NotSupported(NotSupportedError::new()));
+        }
+
         let surface = self.window.wl_surface();
 
         if hittest {
@@ -740,6 +860,10 @@ impl Window {
 
     #[inline]
     pub fn set_ime_cursor_area(&self, position: Position, size: Size) {
+        if self.is_lost() {
+            return;
+        }
+
         let window_state = self.window_state.lock().unwrap();
         if window_state.ime_allowed() {
             let scale_factor = window_state.scale_factor();
@@ -751,6 +875,10 @@ impl Window {
 
     #[inline]
     pub fn set_ime_allowed(&self, allowed: bool) {
+        if self.is_lost() {
+            return;
+        }
+
         let mut window_state = self.window_state.lock().unwrap();
 
         if window_state.ime_allowed() != allowed && window_state.set_ime_allowed(allowed)
@@ -767,6 +895,10 @@ impl Window {
 
     #[inline]
     pub fn set_ime_purpose(&self, purpose: ImePurpose) {
+        if self.is_lost() {
+            return;
+        }
+
         self.window_state.lock().unwrap().set_ime_purpose(purpose);
     }
 
@@ -782,6 +914,10 @@ impl Window {
         size: LogicalSize<f64>,
         output: Option<PlatformMonitorHandle>,
     ) {
+        if self.is_lost() {
+            return;
+        }
+
         let Some(layer) = self.window.layer() else {
             return;
         };
@@ -802,6 +938,10 @@ impl Window {
     }
 
     pub fn activate_with_token(&self, token: String) {
+        if self.is_lost() {
+            return;
+        }
+
         if let Some(activation) = &self.xdg_activation {
             activation.activate(token, self.window.wl_surface());
             self.event_loop_awakener.ping();
@@ -815,6 +955,10 @@ impl Window {
 
     #[inline]
     pub fn current_monitor(&self) -> Option<MonitorHandle> {
+        if self.is_lost() {
+            return None;
+        }
+
         let data = self.window.wl_surface().data::<SurfaceData>()?;
         // A compositor need not send surface.leave before removing an output.
         // SCTK can therefore retain old proxies across a layer remap.
@@ -826,6 +970,10 @@ impl Window {
 
     #[inline]
     pub fn available_monitors(&self) -> Vec<MonitorHandle> {
+        if self.is_lost() {
+            return Vec::new();
+        }
+
         self.monitors.lock().unwrap().clone()
     }
 
@@ -839,6 +987,10 @@ impl Window {
     pub fn raw_window_handle_raw_window_handle(
         &self,
     ) -> Result<raw_window_handle::RawWindowHandle, raw_window_handle::HandleError> {
+        if self.is_lost() {
+            return Err(raw_window_handle::HandleError::Unavailable);
+        }
+
         Ok(raw_window_handle::WaylandWindowHandle::new({
             let ptr = self.window.wl_surface().id().as_ptr();
             std::ptr::NonNull::new(ptr as *mut _).expect("wl_surface will never be null")
@@ -850,6 +1002,10 @@ impl Window {
     pub fn raw_display_handle_raw_window_handle(
         &self,
     ) -> Result<raw_window_handle::RawDisplayHandle, raw_window_handle::HandleError> {
+        if self.is_lost() {
+            return Err(raw_window_handle::HandleError::Unavailable);
+        }
+
         Ok(raw_window_handle::WaylandDisplayHandle::new({
             let ptr = self.display.id().as_ptr();
             std::ptr::NonNull::new(ptr as *mut _).expect("wl_proxy should never be null")
@@ -859,6 +1015,10 @@ impl Window {
 
     #[inline]
     pub fn set_theme(&self, theme: Option<Theme>) {
+        if self.is_lost() {
+            return;
+        }
+
         self.window_state.lock().unwrap().set_theme(theme)
     }
 
@@ -890,6 +1050,9 @@ pub struct WindowRequests {
 
     /// Redraw Requested.
     pub redraw_requested: AtomicBool,
+
+    /// The display connection this window belonged to is gone, the window is inert.
+    pub lost: AtomicBool,
 }
 
 impl WindowRequests {

@@ -232,6 +232,36 @@ pub trait ApplicationHandler<T: 'static = ()> {
         let _ = event_loop;
     }
 
+    /// Emitted when the connection to the display server was lost, e.g. the Wayland
+    /// compositor exited or was replaced (`kwin --replace`).
+    ///
+    /// All windows created before this point are dead: their methods become no-ops (or
+    /// return benign defaults/errors), no more events are delivered for them, and their
+    /// raw window/display handles report [`HandleError::Unavailable`]. The application
+    /// should drop every resource derived from them (graphics surfaces, etc.) and keep
+    /// its own state, then wait for [`display_restored`] to recreate windows.
+    ///
+    /// If the display can't be re-established in time the event loop exits with an error.
+    ///
+    /// # Platform-specific
+    ///
+    /// - **Wayland only:** never emitted on other platforms/backends.
+    ///
+    /// [`HandleError::Unavailable`]: raw_window_handle::HandleError::Unavailable
+    /// [`display_restored`]: Self::display_restored
+    fn display_lost(&mut self, event_loop: &ActiveEventLoop) {
+        let _ = event_loop;
+    }
+
+    /// Emitted after the connection to the display server was re-established following a
+    /// [`display_lost`]. Windows must be created anew with
+    /// [`ActiveEventLoop::create_window`], they will have fresh [`WindowId`] values.
+    ///
+    /// [`display_lost`]: Self::display_lost
+    fn display_restored(&mut self, event_loop: &ActiveEventLoop) {
+        let _ = event_loop;
+    }
+
     fn hook_event(
         &mut self,
         event_loop: &ActiveEventLoop,
