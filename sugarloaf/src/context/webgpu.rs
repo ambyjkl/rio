@@ -3,7 +3,13 @@ use crate::SugarloafRenderer;
 
 pub struct WgpuContext<'a> {
     pub device: wgpu::Device,
-    pub surface: wgpu::Surface<'a>,
+    /// `None` while detached (see `detach_surface`).
+    pub surface: Option<wgpu::Surface<'a>>,
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    /// Whether the live surface was created from a Wayland display
+    /// (selects the leak-instead-of-drop policy in `detach_surface`).
+    surface_is_wayland: bool,
     pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
     pub alpha_mode: wgpu::CompositeAlphaMode,
@@ -43,6 +49,10 @@ impl<'a> WgpuContext<'a> {
         tracing::info!("selected instance: {instance:?}");
         tracing::info!("initializing the surface");
 
+        let surface_is_wayland = matches!(
+            sugarloaf_window.display,
+            raw_window_handle::RawDisplayHandle::Wayland(_)
+        );
         let surface: wgpu::Surface<'a> =
             instance.create_surface(sugarloaf_window).unwrap();
 
@@ -175,32 +185,8 @@ impl<'a> WgpuContext<'a> {
 
         let surface_caps = surface.get_capabilities(&adapter);
 
-        #[cfg(target_os = "macos")]
-        let format = get_macos_texture_format(renderer_config.colorspace);
-        #[cfg(not(target_os = "macos"))]
-        let format = find_best_texture_format(
-            surface_caps.formats.as_slice(),
-            renderer_config.colorspace,
-        );
-
-        // Every sugarloaf pipeline emits premultiplied alpha, so a surface
-        // that can composite premultiplied directly is the correct match;
-        // PostMultiplied stays as the fallback for surfaces that offer
-        // nothing else (wgpu's Metal backend), where only the fully-opaque
-        // and fully-transparent pixels compose identically either way.
-        let alpha_mode = if surface_caps
-            .alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
-        {
-            wgpu::CompositeAlphaMode::PreMultiplied
-        } else if surface_caps
-            .alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
-        {
-            wgpu::CompositeAlphaMode::PostMultiplied
-        } else {
-            wgpu::CompositeAlphaMode::Auto
-        };
+        let format = Self::pick_format(&surface_caps, renderer_config.colorspace);
+        let alpha_mode = Self::pick_alpha_mode(&surface_caps);
 
         // Configure view formats for wide color gamut support
         let view_formats = match renderer_config.colorspace {
@@ -237,7 +223,10 @@ impl<'a> WgpuContext<'a> {
         WgpuContext {
             device,
             queue,
-            surface,
+            surface: Some(surface),
+            instance,
+            adapter,
+            surface_is_wayland,
             format,
             alpha_mode,
             size: SugarloafWindowSize {
@@ -252,6 +241,137 @@ impl<'a> WgpuContext<'a> {
             colorspace: renderer_config.colorspace,
             max_texture_dimension_2d,
         }
+    }
+
+    fn pick_format(
+        surface_caps: &wgpu::SurfaceCapabilities,
+        colorspace: Colorspace,
+    ) -> wgpu::TextureFormat {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = surface_caps;
+            get_macos_texture_format(colorspace)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            find_best_texture_format(surface_caps.formats.as_slice(), colorspace)
+        }
+    }
+
+    // Every sugarloaf pipeline emits premultiplied alpha, so a surface
+    // that can composite premultiplied directly is the correct match;
+    // PostMultiplied stays as the fallback for surfaces that offer
+    // nothing else (wgpu's Metal backend), where only the fully-opaque
+    // and fully-transparent pixels compose identically either way.
+    fn pick_alpha_mode(
+        surface_caps: &wgpu::SurfaceCapabilities,
+    ) -> wgpu::CompositeAlphaMode {
+        if surface_caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else if surface_caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+        {
+            wgpu::CompositeAlphaMode::PostMultiplied
+        } else {
+            wgpu::CompositeAlphaMode::Auto
+        }
+    }
+
+    fn view_formats(&self) -> Vec<wgpu::TextureFormat> {
+        match self.colorspace {
+            Colorspace::DisplayP3 | Colorspace::Rec2020 => vec![self.format],
+            Colorspace::Srgb => vec![],
+        }
+    }
+
+    #[inline]
+    pub fn is_detached(&self) -> bool {
+        self.surface.is_none()
+    }
+
+    /// Drop the wgpu surface tied to the old window. On Wayland the
+    /// Vulkan/GL backends destroy their swapchain and `VkSurfaceKHR` /
+    /// `EGLSurface` in `Drop`, which calls into the (after a compositor
+    /// handover possibly already freed) `wl_display`; so the surface is
+    /// deliberately leaked via `mem::forget` instead of dropped. Other
+    /// window systems drop normally.
+    pub fn detach_surface(&mut self) {
+        let Some(surface) = self.surface.take() else {
+            return;
+        };
+        // Retire GPU work that may still reference the swapchain image.
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        if self.surface_is_wayland {
+            tracing::info!("leaking Wayland wgpu surface of the old display");
+            std::mem::forget(surface);
+        } else {
+            drop(surface);
+        }
+    }
+
+    /// Create a surface for `window` from the retained `wgpu::Instance`,
+    /// verify the adapter can present to it and that its preferred
+    /// format matches the one the pipelines were built for, then
+    /// configure it. On error the context stays detached.
+    pub fn attach_surface(
+        &mut self,
+        window: SugarloafWindow,
+        size: SugarloafWindowSize,
+        scale: f32,
+    ) -> Result<(), String> {
+        self.detach_surface();
+
+        let is_wayland = matches!(
+            window.display,
+            raw_window_handle::RawDisplayHandle::Wayland(_)
+        );
+        let surface: wgpu::Surface<'a> = self
+            .instance
+            .create_surface(window)
+            .map_err(|e| format!("failed to create wgpu surface: {e}"))?;
+        if !self.adapter.is_surface_supported(&surface) {
+            return Err(format!(
+                "adapter '{}' cannot present to the new surface",
+                self.adapter_info.name
+            ));
+        }
+        let surface_caps = surface.get_capabilities(&self.adapter);
+        if surface_caps.formats.is_empty() {
+            return Err("new surface reports no supported formats".into());
+        }
+        let format = Self::pick_format(&surface_caps, self.colorspace);
+        if format != self.format {
+            return Err(format!(
+                "new surface prefers format {format:?} but pipelines were built for {:?}",
+                self.format
+            ));
+        }
+
+        self.surface_caps = surface_caps;
+        self.alpha_mode = Self::pick_alpha_mode(&self.surface_caps);
+        self.surface_is_wayland = is_wayland;
+        self.size = size;
+        self.scale = scale;
+        surface.configure(
+            &self.device,
+            &wgpu::SurfaceConfiguration {
+                usage: Self::get_texture_usage(&self.surface_caps),
+                format: self.format,
+                width: (size.width as u32).max(1),
+                height: (size.height as u32).max(1),
+                view_formats: self.view_formats(),
+                alpha_mode: self.alpha_mode,
+                color_space: wgpu::SurfaceColorSpace::Auto,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+            },
+        );
+        self.surface = Some(surface);
+        Ok(())
     }
 
     fn get_texture_usage(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureUsages {
@@ -281,17 +401,13 @@ impl<'a> WgpuContext<'a> {
         self.size.width = width as f32;
         self.size.height = height as f32;
 
-        // Configure view formats for wide color gamut support
-        let view_formats = match self.colorspace {
-            Colorspace::DisplayP3 | Colorspace::Rec2020 => {
-                vec![self.format]
-            }
-            Colorspace::Srgb => {
-                vec![]
-            }
+        let Some(surface) = self.surface.as_ref() else {
+            return;
         };
+        // Configure view formats for wide color gamut support
+        let view_formats = self.view_formats();
 
-        self.surface.configure(
+        surface.configure(
             &self.device,
             &wgpu::SurfaceConfiguration {
                 usage: Self::get_texture_usage(&self.surface_caps),

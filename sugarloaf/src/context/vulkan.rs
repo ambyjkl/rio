@@ -122,6 +122,18 @@ pub struct VulkanContext {
     /// earliest convenience (we already did if ERROR_OUT_OF_DATE_KHR, but
     /// SUBOPTIMAL_KHR says "still usable this frame").
     pub needs_recreate: bool,
+    /// Set when the driver reported `ERROR_SURFACE_LOST_KHR` (dead
+    /// compositor connection, destroyed window) or a swapchain rebuild
+    /// failed. While set, `acquire_frame` returns `None` (no GPU work,
+    /// no calls into the platform connection). Cleared by a successful
+    /// `resize` swapchain rebuild or by `attach_surface`.
+    pub surface_lost: bool,
+    /// `true` between `detach_surface` and a successful
+    /// `attach_surface`: no `VkSurfaceKHR` / `VkSwapchainKHR` exists.
+    detached: bool,
+    /// Window-system flavour of the live surface. Selects the
+    /// teardown policy in `detach_surface` (see there).
+    surface_kind: SurfaceKind,
 
     // Per-frame state.
     frame_index: usize,
@@ -168,6 +180,28 @@ pub struct VulkanContext {
     /// `instance` (declaration order) so the messenger handle is
     /// destroyed while the instance is still alive.
     _debug_messenger: Option<DebugMessenger>,
+}
+
+/// Window-system flavour a surface was created for. The Vulkan instance
+/// only enables the one platform surface extension matching the window
+/// it was created with, so `attach_surface` can only rebind to a window
+/// of the same flavour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceKind {
+    Xlib,
+    Xcb,
+    Wayland,
+}
+
+impl SurfaceKind {
+    fn of(display: RawDisplayHandle) -> Option<Self> {
+        match display {
+            RawDisplayHandle::Xlib(_) => Some(Self::Xlib),
+            RawDisplayHandle::Xcb(_) => Some(Self::Xcb),
+            RawDisplayHandle::Wayland(_) => Some(Self::Wayland),
+            _ => None,
+        }
+    }
 }
 
 /// Owns one `vk::DebugUtilsMessengerEXT` and its loader. Destroyed
@@ -227,6 +261,8 @@ impl VulkanContext {
         };
         let surface_loader = khr::surface::Instance::new(&entry, &instance);
         let surface = create_surface(&entry, &instance, &sugarloaf_window);
+        let sugarloaf_window_display =
+            sugarloaf_window.display_handle().unwrap().as_raw();
 
         let (physical_device, queue_family_index) =
             pick_physical_device(&instance, &surface_loader, surface);
@@ -253,7 +289,9 @@ impl VulkanContext {
             size.width as u32,
             size.height as u32,
             vk::SwapchainKHR::null(),
-        );
+            None,
+        )
+        .expect("create_swapchain");
 
         let frames = create_frames(&device, queue_family_index);
 
@@ -288,6 +326,10 @@ impl VulkanContext {
             supports_f16,
             colorspace: Colorspace::Srgb,
             needs_recreate: false,
+            surface_lost: false,
+            detached: false,
+            surface_kind: SurfaceKind::of(sugarloaf_window_display)
+                .expect("unsupported display handle"),
             frame_index: 0,
             frames,
             swapchain_extent,
@@ -326,11 +368,19 @@ impl VulkanContext {
         }
         self.size.width = width as f32;
         self.size.height = height as f32;
+        if self.detached {
+            // No surface to size; the new size is picked up by
+            // `attach_surface`'s caller-provided size.
+            return;
+        }
         // Do not drain the GPU or allocate a swapchain while dispatching
         // resize events. Draw once using the latest requested dimensions.
         self.needs_recreate = true;
     }
 
+    /// Rebuild the swapchain for the current surface. On failure the
+    /// context enters the `surface_lost` state instead of panicking
+    /// (the usual cause is a dead compositor connection).
     fn recreate_swapchain(&mut self, width: u32, height: u32) {
         // Retain the synchronization needed to destroy the old resources.
         // Recreation happens at acquisition, not for every resize event.
@@ -345,18 +395,29 @@ impl VulkanContext {
         self.swapchain_images.clear();
 
         let old = self.swapchain;
-        let (swapchain, format, color_space, extent, images, views) = create_swapchain(
-            &self.shared.raw,
-            &self.surface_loader,
-            &self.swapchain_loader,
-            self.shared.physical_device,
-            self.surface,
-            width,
-            height,
-            old,
-        );
+        let (swapchain, format, color_space, extent, images, views) =
+            match create_swapchain(
+                &self.shared.raw,
+                &self.surface_loader,
+                &self.swapchain_loader,
+                self.shared.physical_device,
+                self.surface,
+                width,
+                height,
+                old,
+                None,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("swapchain recreation failed, surface lost: {e}");
+                    self.surface_lost = true;
+                    self.needs_recreate = false;
+                    return;
+                }
+            };
 
         unsafe { self.swapchain_loader.destroy_swapchain(old, None) };
+        self.surface_lost = false;
 
         self.swapchain = swapchain;
         self.swapchain_format = format;
@@ -367,10 +428,232 @@ impl VulkanContext {
         self.needs_recreate = false;
     }
 
+    /// `true` while no surface / swapchain exists (between
+    /// `detach_surface` and a successful `attach_surface`).
+    #[inline]
+    pub fn is_detached(&self) -> bool {
+        self.detached
+    }
+
+    /// Release the swapchain and `VkSurfaceKHR` tied to the old window,
+    /// keeping instance, device, queue, pipeline cache and per-frame
+    /// sync objects alive. Idempotent. Afterwards `acquire_frame`
+    /// returns `None` and `resize` only records the size.
+    ///
+    /// # Teardown policy (compositor handover)
+    ///
+    /// After `kwin --replace` the old `wl_display` connection is dead
+    /// (socket closed), and the window system integration may free or
+    /// disconnect it at any time. Both `vkDestroySwapchainKHR` and
+    /// `vkDestroySurfaceKHR` go through the driver's Wayland WSI code
+    /// (Mesa `wsi_wl_*`, NVIDIA's equivalent), which dereferences the
+    /// `wl_display*` / `wl_surface*` it was created with: it destroys
+    /// `wl_buffer` proxies (a destructor request marshalled onto the
+    /// connection), frees its private `wl_event_queue`, and releases
+    /// registry/proxy wrappers (needs the `wl_display` struct memory).
+    /// On a merely *errored* connection those calls are harmless
+    /// (requests fail with EPIPE, local proxy bookkeeping still works),
+    /// but if the `wl_display` has already been `wl_display_disconnect`ed
+    /// it is a use-after-free in the driver, and nothing in the Vulkan
+    /// API lets us ask which case we are in. So for Wayland surfaces
+    /// this deliberately **leaks** the `VkSwapchainKHR` and the
+    /// `VkSurfaceKHR` (never calls the destroy entry points; a swapchain
+    /// must not outlive its surface, so both are leaked together):
+    /// cost is a handful of swapchain images' GPU memory plus a few
+    /// driver-side proxies, once per compositor handover, reclaimed at
+    /// process exit. The device-level objects that do not depend on the
+    /// connection (image views over the swapchain images) are destroyed
+    /// normally after `vkDeviceWaitIdle`, so no GPU work references them.
+    ///
+    /// X11 (Xlib/Xcb) surfaces are destroyed properly: the same
+    /// hazard exists in principle but no handover scenario exists there.
+    pub fn detach_surface(&mut self) {
+        if self.detached {
+            return;
+        }
+        unsafe {
+            // Retire all in-flight GPU work first; presents already
+            // queued to a dead connection cannot block this.
+            let _ = self.shared.device_wait_idle();
+            for &view in &self.swapchain_views {
+                self.shared.destroy_image_view(view, None);
+            }
+            match self.surface_kind {
+                SurfaceKind::Wayland => {
+                    // Intentional leak: see the doc comment above.
+                    tracing::info!(
+                        "leaking Wayland VkSwapchainKHR/VkSurfaceKHR of the old display"
+                    );
+                }
+                SurfaceKind::Xlib | SurfaceKind::Xcb => {
+                    self.swapchain_loader
+                        .destroy_swapchain(self.swapchain, None);
+                    self.surface_loader.destroy_surface(self.surface, None);
+                }
+            }
+        }
+        self.swapchain_views.clear();
+        self.swapchain_images.clear();
+        self.swapchain = vk::SwapchainKHR::null();
+        self.surface = vk::SurfaceKHR::null();
+        self.needs_recreate = false;
+        self.surface_lost = false;
+        self.detached = true;
+    }
+
+    /// Create a surface + swapchain for `window` and resume rendering.
+    /// `window.size` / `window.scale` are ignored in favour of the
+    /// explicit `size` / `scale` (physical pixels / scale factor).
+    ///
+    /// Fails (leaving the context detached, new surface destroyed) if
+    /// the window system differs from the one the Vulkan instance was
+    /// created for, if the physical device's graphics queue family
+    /// cannot present to the new surface, or if the new surface does not
+    /// offer the swapchain format/color space the existing pipelines were
+    /// built for (pipelines bake the color attachment format in; the
+    /// grid renderers live outside `Sugarloaf`, so they cannot be
+    /// rebuilt transparently).
+    pub fn attach_surface(
+        &mut self,
+        window: &SugarloafWindow,
+        size: SugarloafWindowSize,
+        scale: f32,
+    ) -> Result<(), String> {
+        if !self.detached {
+            self.detach_surface();
+        }
+
+        let display = window
+            .display_handle()
+            .map_err(|e| format!("display handle unavailable: {e}"))?
+            .as_raw();
+        let kind = SurfaceKind::of(display)
+            .ok_or_else(|| format!("unsupported display handle {display:?}"))?;
+        if kind != self.surface_kind {
+            return Err(format!(
+                "Vulkan instance was created for a {:?} window; cannot attach a {:?} window",
+                self.surface_kind, kind
+            ));
+        }
+
+        let surface =
+            try_create_surface(&self.shared._entry, &self.shared.instance, window)?;
+
+        // From here on, failure destroys the *new* surface (its display
+        // is alive) and leaves us detached.
+        let fail = |this: &Self, msg: String| -> Result<(), String> {
+            unsafe { this.surface_loader.destroy_surface(surface, None) };
+            Err(msg)
+        };
+
+        let can_present = unsafe {
+            self.surface_loader.get_physical_device_surface_support(
+                self.shared.physical_device,
+                self.queue_family_index,
+                surface,
+            )
+        };
+        match can_present {
+            Ok(true) => {}
+            Ok(false) => {
+                return fail(
+                    self,
+                    format!(
+                        "physical device '{}' (queue family {}) cannot present to the new surface",
+                        physical_device_name(
+                            &self.shared.instance,
+                            self.shared.physical_device
+                        ),
+                        self.queue_family_index
+                    ),
+                )
+            }
+            Err(e) => {
+                return fail(
+                    self,
+                    format!("get_physical_device_surface_support failed: {e:?}"),
+                )
+            }
+        }
+
+        let width = (size.width as u32).max(1);
+        let height = (size.height as u32).max(1);
+        let (swapchain, format, color_space, extent, images, views) =
+            match create_swapchain(
+                &self.shared.raw,
+                &self.surface_loader,
+                &self.swapchain_loader,
+                self.shared.physical_device,
+                surface,
+                width,
+                height,
+                vk::SwapchainKHR::null(),
+                Some((self.swapchain_format, self.swapchain_color_space)),
+            ) {
+                Ok(r) => r,
+                Err(e) => return fail(self, e),
+            };
+
+        // Semaphores may be left signalled and fences unsignalled by
+        // frames that were abandoned when the old surface died; the
+        // device is idle (detach waited), so just recreate them.
+        unsafe {
+            for frame in &mut self.frames {
+                self.shared.destroy_semaphore(frame.image_available, None);
+                self.shared.destroy_semaphore(frame.render_finished, None);
+                self.shared.destroy_fence(frame.in_flight, None);
+                frame.image_available = self
+                    .shared
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .expect("create_semaphore");
+                frame.render_finished = self
+                    .shared
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .expect("create_semaphore");
+                frame.in_flight = self
+                    .shared
+                    .create_fence(
+                        &vk::FenceCreateInfo::default()
+                            .flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )
+                    .expect("create_fence");
+            }
+        }
+
+        tracing::info!(
+            "Attached new surface: {:?} {}x{} ({} images)",
+            format,
+            extent.width,
+            extent.height,
+            images.len()
+        );
+
+        self.surface = surface;
+        self.swapchain = swapchain;
+        self.swapchain_format = format;
+        self.swapchain_color_space = color_space;
+        self.swapchain_extent = extent;
+        self.swapchain_images = images;
+        self.swapchain_views = views;
+        self.size = size;
+        self.scale = scale;
+        self.needs_recreate = false;
+        self.surface_lost = false;
+        self.detached = false;
+        Ok(())
+    }
+
     /// Acquire the next swapchain image and begin the per-frame command
     /// buffer. Returns `None` if the swapchain needed recreation (caller
     /// should skip this frame).
     pub fn acquire_frame(&mut self) -> Option<VulkanFrame> {
+        // Detached or lost: never touch the swapchain / platform
+        // connection (it may belong to a dead display).
+        if self.detached || self.surface_lost {
+            return None;
+        }
+
         // Honor a recreate request observed on the previous tick
         // (suboptimal acquire, suboptimal present, or OUT_OF_DATE on
         // present). Mirrors wgpu/Metal/wgpu-via-zed practice: keep
@@ -379,6 +662,9 @@ impl VulkanContext {
         // declared stale.
         if self.needs_recreate {
             self.recreate_swapchain(self.size.width as u32, self.size.height as u32);
+            if self.surface_lost {
+                return None;
+            }
         }
 
         let slot = self.frame_index;
@@ -403,6 +689,11 @@ impl VulkanContext {
                         self.size.width as u32,
                         self.size.height as u32,
                     );
+                    return None;
+                }
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                    tracing::warn!("acquire_next_image: surface lost");
+                    self.surface_lost = true;
                     return None;
                 }
                 Err(e) => panic!("acquire_next_image failed: {e:?}"),
@@ -480,6 +771,10 @@ impl VulkanContext {
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.needs_recreate = true;
+                }
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                    tracing::warn!("queue_present: surface lost");
+                    self.surface_lost = true;
                 }
                 Err(e) => panic!("queue_present failed: {e:?}"),
             }
@@ -1033,6 +1328,7 @@ impl Drop for VulkanContext {
             for &view in &self.swapchain_views {
                 self.shared.destroy_image_view(view, None);
             }
+            // Null handles (detached) are valid no-ops for both calls.
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
             self.surface_loader.destroy_surface(self.surface, None);
@@ -1249,8 +1545,16 @@ fn create_surface(
     instance: &Instance,
     window: &SugarloafWindow,
 ) -> vk::SurfaceKHR {
-    let display = window.display_handle().unwrap().as_raw();
-    let window_handle = window.window_handle().unwrap().as_raw();
+    try_create_surface(entry, instance, window).unwrap_or_else(|e| panic!("{e}"))
+}
+
+fn try_create_surface(
+    entry: &Entry,
+    instance: &Instance,
+    window: &SugarloafWindow,
+) -> Result<vk::SurfaceKHR, String> {
+    let display = window.display_handle().map_err(|e| e.to_string())?.as_raw();
+    let window_handle = window.window_handle().map_err(|e| e.to_string())?.as_raw();
 
     unsafe {
         match (display, window_handle) {
@@ -1266,7 +1570,7 @@ fn create_surface(
                     .window(w.window);
                 loader
                     .create_xlib_surface(&info, None)
-                    .expect("create_xlib_surface")
+                    .map_err(|e| format!("create_xlib_surface: {e:?}"))
             }
             (RawDisplayHandle::Xcb(d), RawWindowHandle::Xcb(w)) => {
                 let loader = khr::xcb_surface::Instance::new(entry, instance);
@@ -1280,7 +1584,7 @@ fn create_surface(
                     .window(w.window.get());
                 loader
                     .create_xcb_surface(&info, None)
-                    .expect("create_xcb_surface")
+                    .map_err(|e| format!("create_xcb_surface: {e:?}"))
             }
             (RawDisplayHandle::Wayland(d), RawWindowHandle::Wayland(w)) => {
                 let loader = khr::wayland_surface::Instance::new(entry, instance);
@@ -1289,11 +1593,11 @@ fn create_surface(
                     .surface(w.surface.as_ptr().cast());
                 loader
                     .create_wayland_surface(&info, None)
-                    .expect("create_wayland_surface")
+                    .map_err(|e| format!("create_wayland_surface: {e:?}"))
             }
-            (d, w) => panic!(
+            (d, w) => Err(format!(
                 "Vulkan backend: mismatched or unsupported handles: display={d:?} window={w:?}"
-            ),
+            )),
         }
     }
 }
@@ -1400,37 +1704,64 @@ fn create_swapchain(
     requested_width: u32,
     requested_height: u32,
     old: vk::SwapchainKHR,
-) -> (
-    vk::SwapchainKHR,
-    vk::Format,
-    vk::ColorSpaceKHR,
-    vk::Extent2D,
-    Vec<vk::Image>,
-    Vec<vk::ImageView>,
-) {
+    // When `Some`, the surface MUST offer exactly this format + color
+    // space (used by `attach_surface`: every pipeline was built for it,
+    // so a different swapchain format is an error, not a fallback).
+    required_format: Option<(vk::Format, vk::ColorSpaceKHR)>,
+) -> Result<
+    (
+        vk::SwapchainKHR,
+        vk::Format,
+        vk::ColorSpaceKHR,
+        vk::Extent2D,
+        Vec<vk::Image>,
+        Vec<vk::ImageView>,
+    ),
+    String,
+> {
     let caps = unsafe {
         surface_loader
             .get_physical_device_surface_capabilities(physical_device, surface)
-            .expect("get_physical_device_surface_capabilities")
+            .map_err(|e| format!("get_physical_device_surface_capabilities: {e:?}"))?
     };
     let formats = unsafe {
         surface_loader
             .get_physical_device_surface_formats(physical_device, surface)
-            .expect("get_physical_device_surface_formats")
+            .map_err(|e| format!("get_physical_device_surface_formats: {e:?}"))?
     };
+    if formats.is_empty() {
+        return Err("surface reports no supported formats".into());
+    }
     // Prefer BGRA8_UNORM (linear) so blending stays in gamma space — the
     // same choice Metal makes (`MTLPixelFormat::BGRA8Unorm` + DisplayP3
     // tag). Fragment shaders will emit sRGB-encoded output. If the
     // driver doesn't offer BGRA8_UNORM, fall back to whatever it gives
     // us — formats[0] is guaranteed present per the spec.
-    let chosen_format = formats
-        .iter()
-        .find(|f| {
-            f.format == vk::Format::B8G8R8A8_UNORM
-                && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-        })
-        .copied()
-        .unwrap_or(formats[0]);
+    let chosen_format = if let Some((format, color_space)) = required_format {
+        formats
+            .iter()
+            .find(|f| f.format == format && f.color_space == color_space)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "new surface does not offer the swapchain format {format:?}/{color_space:?} \
+                     that the existing pipelines were built for (offered: {:?})",
+                    formats
+                        .iter()
+                        .map(|f| (f.format, f.color_space))
+                        .collect::<Vec<_>>()
+                )
+            })?
+    } else {
+        formats
+            .iter()
+            .find(|f| {
+                f.format == vk::Format::B8G8R8A8_UNORM
+                    && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+            })
+            .copied()
+            .unwrap_or(formats[0])
+    };
 
     let extent = if caps.current_extent.width != u32::MAX {
         caps.current_extent
@@ -1471,10 +1802,15 @@ fn create_swapchain(
         .old_swapchain(old);
 
     let swapchain = unsafe { swapchain_loader.create_swapchain(&create_info, None) }
-        .expect("create_swapchain");
+        .map_err(|e| format!("create_swapchain: {e:?}"))?;
 
-    let images = unsafe { swapchain_loader.get_swapchain_images(swapchain) }
-        .expect("get_swapchain_images");
+    let images = match unsafe { swapchain_loader.get_swapchain_images(swapchain) } {
+        Ok(images) => images,
+        Err(e) => {
+            unsafe { swapchain_loader.destroy_swapchain(swapchain, None) };
+            return Err(format!("get_swapchain_images: {e:?}"));
+        }
+    };
 
     let views = images
         .iter()
@@ -1496,14 +1832,14 @@ fn create_swapchain(
         })
         .collect();
 
-    (
+    Ok((
         swapchain,
         chosen_format.format,
         chosen_format.color_space,
         extent,
         images,
         views,
-    )
+    ))
 }
 
 fn guess_composite_alpha(

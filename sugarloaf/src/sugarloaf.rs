@@ -861,8 +861,87 @@ impl Sugarloaf<'_> {
         self.state.style.scale_factor
     }
 
+    /// Release the swapchain / surface / presenter bound to the current
+    /// window while keeping the GPU device, glyph and image atlases,
+    /// pipelines, and all scene state alive, so the instance can later
+    /// be rebound with [`attach_surface`](Self::attach_surface) (Wayland
+    /// compositor handover: the window is re-created on a new
+    /// `wl_display`).
+    ///
+    /// While detached, `render*` and `resize` are safe no-ops (frame
+    /// batches are discarded) and nothing touches the old window system
+    /// connection. Idempotent. Waits for the GPU to go idle.
+    ///
+    /// Teardown policy: for Wayland surfaces the backend-specific
+    /// swapchain and surface handles (`VkSwapchainKHR` + `VkSurfaceKHR`,
+    /// wgpu `Surface`, softbuffer surface) are **leaked** rather than
+    /// destroyed, because the driver's destroy path dereferences the old
+    /// `wl_display`, which may be dead or already freed; destroying
+    /// could crash the process. It is therefore safe to call this
+    /// before or after the old display is torn down. See
+    /// `VulkanContext::detach_surface` for the analysis. X11 handles are
+    /// destroyed normally. The Metal backend has no detach support
+    /// (no-op).
+    pub fn detach_surface(&mut self) {
+        self.ctx.detach_surface();
+    }
+
+    /// Bind this Sugarloaf to a new window: create a surface from
+    /// `window`'s raw handles, build a swapchain of `size` (physical
+    /// pixels) at `scale`, force a full repaint and resume rendering.
+    /// If a surface is still attached it is detached first.
+    ///
+    /// Everything GPU-side that does not depend on the window (device,
+    /// atlases, pipelines, caches) is reused. Returns `Err` (and stays
+    /// detached) if the physical device cannot present to the new
+    /// surface, if the new surface is of a different window-system
+    /// flavour than the Vulkan instance was created for, or if its
+    /// swapchain format differs from the one the pipelines were built
+    /// for (not rebuildable here: the terminal grid renderers live
+    /// outside `Sugarloaf`).
+    ///
+    /// The caller should still schedule a redraw of its own scene.
+    pub fn attach_surface(
+        &mut self,
+        window: SugarloafWindow,
+        size: SugarloafWindowSize,
+        scale: f32,
+    ) -> Result<(), String> {
+        self.ctx.attach_surface(window, size, scale)?;
+        if (self.state.style.scale_factor - scale).abs() > f32::EPSILON {
+            self.rescale(scale);
+        }
+        self.renderer.resize(&mut self.ctx);
+        // The new surface starts blank: defeat the CPU backend's
+        // "frame unchanged, skip present" shortcut. GPU backends redraw
+        // every frame unconditionally; per-frame batches are immediate
+        // mode, so no other cached state needs invalidation.
+        self.cpu_cache.invalidate_frame();
+        Ok(())
+    }
+
+    /// `true` between [`detach_surface`](Self::detach_surface) and a
+    /// successful [`attach_surface`](Self::attach_surface).
+    #[inline]
+    pub fn is_surface_detached(&self) -> bool {
+        self.ctx.is_surface_detached()
+    }
+
+    /// `true` if the platform reported the surface as lost (e.g. Vulkan
+    /// `ERROR_SURFACE_LOST_KHR` after the compositor connection died).
+    /// Rendering is then a no-op until a successful `resize` or
+    /// `attach_surface`. Embedders can use it as a hint to start a
+    /// handover.
+    #[inline]
+    pub fn is_surface_lost(&self) -> bool {
+        self.ctx.is_surface_lost()
+    }
+
     #[inline]
     pub fn resize(&mut self, width: u32, height: u32) {
+        if self.ctx.is_surface_detached() {
+            return;
+        }
         self.ctx.resize(width, height);
         self.renderer.resize(&mut self.ctx);
         // No content-state refresh needed for the background image — the
@@ -955,6 +1034,12 @@ impl Sugarloaf<'_> {
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
         mut pre_present: impl FnMut(),
     ) {
+        if self.ctx.is_surface_detached() {
+            // No surface to draw into: drop this frame's immediate-mode
+            // output (it would otherwise pile up until re-attach).
+            self.discard_frame();
+            return;
+        }
         self.state.compute_dimensions();
         self.state.compute_updates(
             &mut self.renderer,
@@ -1211,7 +1296,11 @@ impl Sugarloaf<'_> {
             _ => return,
         };
 
-        let frame = match ctx.surface.get_current_texture() {
+        let Some(surface) = ctx.surface.as_ref() else {
+            self.reset();
+            return;
+        };
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             _ => {

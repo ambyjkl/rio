@@ -128,6 +128,76 @@ impl Context<'_> {
         }
     }
 
+    /// Whether the context currently has no window surface (between
+    /// `detach_surface` and a successful `attach_surface`).
+    #[inline]
+    pub fn is_surface_detached(&self) -> bool {
+        match &self.inner {
+            #[cfg(feature = "wgpu")]
+            ContextType::Wgpu(ctx) => ctx.is_detached(),
+            #[cfg(target_os = "macos")]
+            ContextType::Metal(_) => false,
+            #[cfg(target_os = "linux")]
+            ContextType::Vulkan(ctx) => ctx.is_detached(),
+            ContextType::Cpu(ctx) => ctx.is_detached(),
+            #[cfg(not(feature = "wgpu"))]
+            ContextType::_Phantom(_) => unreachable!(),
+        }
+    }
+
+    /// `true` when the platform reported the surface as lost (Vulkan
+    /// `ERROR_SURFACE_LOST_KHR`, e.g. the compositor connection died)
+    /// and rendering is suspended until `resize` succeeds or a new
+    /// surface is attached. Always `false` on other backends.
+    #[inline]
+    pub fn is_surface_lost(&self) -> bool {
+        match &self.inner {
+            #[cfg(target_os = "linux")]
+            ContextType::Vulkan(ctx) => ctx.surface_lost,
+            _ => false,
+        }
+    }
+
+    /// Destroy (or, for dead Wayland connections, deliberately leak) the
+    /// swapchain/surface tied to the old window. See
+    /// `Sugarloaf::detach_surface`.
+    pub fn detach_surface(&mut self) {
+        match &mut self.inner {
+            #[cfg(feature = "wgpu")]
+            ContextType::Wgpu(ctx) => ctx.detach_surface(),
+            #[cfg(target_os = "macos")]
+            ContextType::Metal(_) => {}
+            #[cfg(target_os = "linux")]
+            ContextType::Vulkan(ctx) => ctx.detach_surface(),
+            ContextType::Cpu(ctx) => ctx.detach_surface(),
+            #[cfg(not(feature = "wgpu"))]
+            ContextType::_Phantom(_) => unreachable!(),
+        }
+    }
+
+    /// Bind the context to a new window. See `Sugarloaf::attach_surface`.
+    pub fn attach_surface(
+        &mut self,
+        window: SugarloafWindow,
+        size: SugarloafWindowSize,
+        scale: f32,
+    ) -> Result<(), String> {
+        match &mut self.inner {
+            #[cfg(feature = "wgpu")]
+            ContextType::Wgpu(ctx) => ctx.attach_surface(window, size, scale),
+            #[cfg(target_os = "macos")]
+            ContextType::Metal(_) => {
+                let _ = (window, size, scale);
+                Err("surface re-attachment is not supported by the Metal backend".into())
+            }
+            #[cfg(target_os = "linux")]
+            ContextType::Vulkan(ctx) => ctx.attach_surface(&window, size, scale),
+            ContextType::Cpu(ctx) => ctx.attach_surface(&window, size, scale),
+            #[cfg(not(feature = "wgpu"))]
+            ContextType::_Phantom(_) => unreachable!(),
+        }
+    }
+
     #[inline]
     pub fn supports_f16(&self) -> bool {
         match &self.inner {

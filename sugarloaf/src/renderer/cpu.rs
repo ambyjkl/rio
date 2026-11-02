@@ -41,6 +41,12 @@ impl CpuCache {
         self.glyphs.clear();
         self.has_last = false;
     }
+
+    /// Forget the last presented frame so the next render repaints even
+    /// if nothing changed (new surface starts with a blank buffer).
+    pub fn invalidate_frame(&mut self) {
+        self.has_last = false;
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
@@ -386,7 +392,12 @@ pub fn render_cpu(
         return;
     }
 
-    let mut buffer = match ctx.surface.buffer_mut() {
+    let Some(surface) = ctx.surface.as_mut() else {
+        // Detached: nothing to present to.
+        cache.has_last = false;
+        return;
+    };
+    let mut buffer = match surface.buffer_mut() {
         Ok(b) => b,
         Err(e) => {
             tracing::error!("softbuffer buffer_mut failed: {e}");
