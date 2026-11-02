@@ -21,7 +21,7 @@ use rio_window::keyboard::{Key, NamedKey};
 use rio_window::platform::startup_notify::{
     self, EventLoopExtStartupNotify, WindowAttributesExtStartupNotify,
 };
-use rio_window::window::Window;
+use rio_window::window::{Fullscreen, Window};
 use routes::{assistant, RoutePath};
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
@@ -494,6 +494,11 @@ pub struct Router<'a> {
     pub quake_window_id: Option<WindowId>,
     pub clipboard: Clipboard,
     current_tab_id: u64,
+    /// Maps the id of a window that died with its display connection to
+    /// the id of the window that replaced it. PTY threads, the
+    /// scheduler and the terminals keep stamping events with the id they
+    /// were created with; [`Router::resolve_window_id`] redirects them.
+    window_aliases: FxHashMap<WindowId, WindowId>,
 }
 
 impl Router<'_> {
@@ -521,7 +526,41 @@ impl Router<'_> {
             font_library: Box::new(font_library),
             clipboard,
             current_tab_id: 0,
+            window_aliases: FxHashMap::default(),
         }
+    }
+
+    /// The current id of the window an event was addressed to, following
+    /// replacements made by [`Router::replace_window_id`].
+    #[inline]
+    pub fn resolve_window_id(&self, id: WindowId) -> WindowId {
+        self.window_aliases.get(&id).copied().unwrap_or(id)
+    }
+
+    /// Record that the window `old` was replaced by `new` after a display
+    /// handover: re-key the route and everything that refers to it.
+    /// Returns `false` if there was no route under `old`.
+    pub fn replace_window_id(&mut self, old: WindowId, new: WindowId) -> bool {
+        let Some(mut route) = self.routes.remove(&old) else {
+            return false;
+        };
+        route.window.screen.ctx_mut().set_window_id(new);
+        self.routes.insert(new, route);
+
+        for target in self.window_aliases.values_mut() {
+            if *target == old {
+                *target = new;
+            }
+        }
+        self.window_aliases.insert(old, new);
+
+        if self.config_route == Some(old) {
+            self.config_route = Some(new);
+        }
+        if self.quake_window_id == Some(old) {
+            self.quake_window_id = Some(new);
+        }
+        true
     }
 
     #[inline]
@@ -766,9 +805,163 @@ pub struct RouteWindow<'a> {
     pub vblank_interval: Duration,
     pub winit_window: Window,
     pub screen: Screen<'a>,
+    /// How the native window was created, kept so it can be created
+    /// again on a new display connection (Wayland compositor handover).
+    spec: WindowSpec,
+    /// `Some` while the display connection is lost: `winit_window` is
+    /// then a dead, inert handle and the sugarloaf surface is detached,
+    /// but the screen (PTYs, tabs, splits, scrollback) is fully alive.
+    orphan: Option<OrphanedWindow>,
+}
+
+/// Creation parameters of a native window, see [`RouteWindow::spec`].
+#[derive(Clone, Debug)]
+struct WindowSpec {
+    name: String,
+    tab_id: Option<String>,
+    app_id: Option<String>,
+    quake: bool,
+}
+
+/// Window state captured when the display connection was lost, used to
+/// recreate an equivalent window afterwards.
+#[derive(Clone, Debug)]
+struct OrphanedWindow {
+    title: String,
+    inner_size: PhysicalSize<u32>,
+    scale: f64,
+    maximized: bool,
+    fullscreen: bool,
+    visible: bool,
 }
 
 impl<'a> RouteWindow<'a> {
+    /// Whether the native window died with the display connection and
+    /// is waiting for [`RouteWindow::restore_window`].
+    #[inline]
+    pub fn is_orphaned(&self) -> bool {
+        self.orphan.is_some()
+    }
+
+    /// Whether this is the quake dropdown window.
+    #[inline]
+    pub fn is_quake(&self) -> bool {
+        self.spec.quake
+    }
+
+    /// Whether the quake window was visible when the display was lost.
+    #[inline]
+    pub fn orphan_was_visible(&self) -> bool {
+        self.orphan.as_ref().is_some_and(|o| o.visible)
+    }
+
+    /// The display connection was lost: remember what the window looked
+    /// like, release the render surface bound to it and drop all
+    /// transient input state. Everything else (PTYs, terminal state,
+    /// tabs, splits, renderer) stays untouched. Idempotent.
+    pub fn orphan_window(&mut self) {
+        if self.orphan.is_some() {
+            return;
+        }
+
+        // The window is gone from the compositor's point of view, so
+        // its keyboard focus is too; tell the applications that track
+        // focus reporting.
+        // The pane focus state dedups, so this is a no-op for windows
+        // that were not focused.
+        self.screen.on_focus_change(false);
+        self.is_focused = false;
+
+        let scale = self.screen.sugarloaf.scale_factor() as f64;
+        let size = self.screen.sugarloaf.window_size();
+        self.orphan = Some(OrphanedWindow {
+            title: if self.last_window_title.is_empty() {
+                self.spec.name.clone()
+            } else {
+                self.last_window_title.clone()
+            },
+            inner_size: PhysicalSize::new(
+                (size.width.round() as u32).max(1),
+                (size.height.round() as u32).max(1),
+            ),
+            scale,
+            maximized: self.winit_window.is_maximized(),
+            fullscreen: self.winit_window.fullscreen().is_some(),
+            visible: self.winit_window.is_visible().unwrap_or(true),
+        });
+
+        self.screen.sugarloaf.detach_surface();
+        self.screen.reset_input_state();
+    }
+
+    /// Create a new native window on the (re-established) display
+    /// connection, bind the render surface to it and bring the screen
+    /// up to date. The old window handle is dropped; it is inert.
+    ///
+    /// On error the route stays orphaned, so this can be retried.
+    pub fn restore_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        config: &RioConfig,
+        quake_monitor: Option<&rio_window::monitor::MonitorHandle>,
+    ) -> Result<WindowId, String> {
+        let Some(orphan) = self.orphan.clone() else {
+            return Ok(self.winit_window.id().into());
+        };
+
+        let logical: rio_window::dpi::LogicalSize<f64> =
+            orphan.inner_size.to_logical(orphan.scale.max(1.0));
+        let window = create_native_window(
+            event_loop,
+            config,
+            &self.spec,
+            &orphan.title,
+            quake_monitor,
+            Some(&|builder: rio_window::window::WindowAttributes| {
+                // The quake window is re-created with the same role
+                // (layer-shell overlay on Wayland) and sized from the
+                // monitor; it is re-anchored whenever it is shown.
+                if self.spec.quake {
+                    return if quake_monitor.is_none() {
+                        builder.with_inner_size(logical)
+                    } else {
+                        builder
+                    };
+                }
+                builder
+                    .with_inner_size(logical)
+                    .with_maximized(orphan.maximized)
+                    .with_fullscreen(
+                        orphan.fullscreen.then_some(Fullscreen::Borderless(None)),
+                    )
+            }),
+        )
+        .map_err(|err| format!("unable to create window: {err}"))?;
+
+        self.screen.rebind_window(&window)?;
+
+        let id: WindowId = window.id().into();
+        // Dropping the old handle is safe, the window is inert.
+        self.winit_window = window;
+        self.orphan = None;
+
+        // A fresh window starts unfocused and unoccluded; focus and
+        // occlusion events from the compositor correct that, like they
+        // do for a window created at startup.
+        self.is_focused = self.winit_window.has_focus();
+        self.focus_seen = false;
+        // Re-sync the focus state of the window and its panes (focus
+        // reporting): everything was reported unfocused when the display
+        // was lost; report focus-in if the new window already has focus.
+        self.screen.on_focus_change(self.is_focused);
+        self.last_window_title = orphan.title;
+        self.is_occluded = false;
+        self.needs_render_after_occlusion = false;
+        self.render_timestamp = Instant::now();
+        self.update_vblank_interval();
+        Ok(id)
+    }
+
     pub fn configure_window(&mut self, config: &rio_backend::config::Config) {
         configure_window(&self.winit_window, config);
     }
@@ -864,51 +1057,21 @@ impl<'a> RouteWindow<'a> {
         quake: bool,
         quake_monitor: Option<rio_window::monitor::MonitorHandle>,
     ) -> RouteWindow<'a> {
-        #[allow(unused_mut)]
-        let mut window_builder =
-            create_window_builder(window_name, config, tab_id, app_id, quake);
-
-        // The quake window starts hidden; the caller anchors it to the
-        // monitor under the cursor and shows it (position changes on
-        // every toggle, not just at creation).
-        if quake {
-            // Geometry must be specified before Wayland's initial configure.
-            if let Some(monitor) = &quake_monitor {
-                window_builder = window_builder.with_inner_size(quake_size(
-                    &config.window,
-                    monitor.size(),
-                    monitor.scale_factor(),
-                ));
-            }
-            window_builder = window_builder.with_visible(false);
-            #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
-            {
-                use rio_window::platform::wayland::ActiveEventLoopExtWayland;
-                if event_loop.is_wayland() {
-                    // Fixed-size hints keep tiling compositors from replacing
-                    // the configured dropdown dimensions with a tile's size.
-                    use rio_window::platform::wayland::WindowAttributesExtWayland;
-                    window_builder = window_builder
-                        .with_resizable(false)
-                        .with_quake_overlay(true);
-                    // Fullscreen/min-max workarounds are only for the xdg
-                    // fallback. Layer-shell overlays cover the requested output
-                    // directly without belonging to a virtual desktop.
-                }
-            }
-        }
-
-        #[cfg(not(any(target_os = "macos", windows)))]
-        if let Some(token) = event_loop.read_token_from_env() {
-            tracing::debug!("Activating window with token: {token:?}");
-            window_builder = window_builder.with_activation_token(token);
-
-            // Remove the token from the env.
-            startup_notify::reset_activation_token_env();
-        }
-
-        let winit_window = event_loop.create_window(window_builder).unwrap();
-        configure_window(&winit_window, config);
+        let spec = WindowSpec {
+            name: window_name.to_string(),
+            tab_id: tab_id.map(str::to_string),
+            app_id: app_id.map(str::to_string),
+            quake,
+        };
+        let winit_window = create_native_window(
+            event_loop,
+            config,
+            &spec,
+            window_name,
+            quake_monitor.as_ref(),
+            None,
+        )
+        .unwrap();
 
         let properties = ScreenWindowProperties {
             size: winit_window.inner_size(),
@@ -981,8 +1144,88 @@ impl<'a> RouteWindow<'a> {
             initial_frame_rendered: false,
             winit_window,
             screen,
+            spec,
+            orphan: None,
         }
     }
+}
+
+type WindowAttributesHook<'h> = Option<
+    &'h dyn Fn(
+        rio_window::window::WindowAttributes,
+    ) -> rio_window::window::WindowAttributes,
+>;
+
+/// Build and create the native window described by `spec`, then apply
+/// the configuration-driven window settings. `adjust` can tweak the
+/// attributes (e.g. restore the pre-handover size) before creation.
+///
+/// This is the single creation path of every native window, including
+/// the quake dropdown (a layer-shell overlay on Wayland), so a window
+/// re-created after a display handover gets the very same role.
+fn create_native_window(
+    event_loop: &ActiveEventLoop,
+    config: &RioConfig,
+    spec: &WindowSpec,
+    title: &str,
+    quake_monitor: Option<&rio_window::monitor::MonitorHandle>,
+    adjust: WindowAttributesHook,
+) -> Result<Window, rio_window::error::OsError> {
+    #[allow(unused_mut)]
+    let mut window_builder = create_window_builder(
+        title,
+        config,
+        spec.tab_id.as_deref(),
+        spec.app_id.as_deref(),
+        spec.quake,
+    );
+
+    // The quake window starts hidden; the caller anchors it to the
+    // monitor under the cursor and shows it (position changes on
+    // every toggle, not just at creation).
+    if spec.quake {
+        // Geometry must be specified before Wayland's initial configure.
+        if let Some(monitor) = quake_monitor {
+            window_builder = window_builder.with_inner_size(quake_size(
+                &config.window,
+                monitor.size(),
+                monitor.scale_factor(),
+            ));
+        }
+        window_builder = window_builder.with_visible(false);
+        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+        {
+            use rio_window::platform::wayland::ActiveEventLoopExtWayland;
+            if event_loop.is_wayland() {
+                // Fixed-size hints keep tiling compositors from replacing
+                // the configured dropdown dimensions with a tile's size.
+                use rio_window::platform::wayland::WindowAttributesExtWayland;
+                window_builder = window_builder
+                    .with_resizable(false)
+                    .with_quake_overlay(true);
+                // Fullscreen/min-max workarounds are only for the xdg
+                // fallback. Layer-shell overlays cover the requested output
+                // directly without belonging to a virtual desktop.
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    if let Some(token) = event_loop.read_token_from_env() {
+        tracing::debug!("Activating window with token: {token:?}");
+        window_builder = window_builder.with_activation_token(token);
+
+        // Remove the token from the env.
+        startup_notify::reset_activation_token_env();
+    }
+
+    if let Some(adjust) = adjust {
+        window_builder = adjust(window_builder);
+    }
+
+    let winit_window = event_loop.create_window(window_builder)?;
+    configure_window(&winit_window, config);
+    Ok(winit_window)
 }
 
 fn centered_position(

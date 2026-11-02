@@ -136,6 +136,16 @@ pub struct ScreenWindowProperties {
 }
 
 #[inline]
+fn sugarloaf_window_size(
+    size: rio_window::dpi::PhysicalSize<u32>,
+) -> SugarloafWindowSize {
+    SugarloafWindowSize {
+        width: size.width as f32,
+        height: size.height as f32,
+    }
+}
+
+#[inline]
 fn window_should_be_opaque(config: &rio_backend::config::Config) -> bool {
     config.window.opacity >= 1.0 && !config.window.blur.is_glass()
 }
@@ -363,6 +373,88 @@ impl Screen<'_> {
             grids: rustc_hash::FxHashMap::default(),
             grid_rasterizer: rio_grid::GridGlyphRasterizer::new(),
         })
+    }
+
+    /// Drop all transient input state: the old window can no longer
+    /// deliver the release/leave/disable events that would normally end
+    /// it (display connection lost), and the new one starts clean.
+    pub fn reset_input_state(&mut self) {
+        self.modifiers = Modifiers::default();
+        self.mouse = Mouse::new(self.mouse.multiplier, self.mouse.divider);
+        self.touchpurpose = TouchPurpose::default();
+        self.resize_state = None;
+        self.last_chrome_press = None;
+        self.last_close_press = None;
+        self.last_hint_probe = None;
+        self.last_ime_cursor_pos = None;
+        self.last_preedit_row = None;
+        self.renderer.scrollbar.end_drag();
+        if let Some(island) = self.renderer.island.as_mut() {
+            island.cancel_drag();
+        }
+        self.clear_highlighted_hint();
+        self.ime = crate::ime::Ime::new();
+        self.mark_dirty();
+    }
+
+    /// Bind the renderer to a new native window (after the display
+    /// connection was re-established): re-attach the sugarloaf surface,
+    /// then bring layout and PTY sizes in line with the new window and
+    /// force a full repaint of every pane.
+    pub fn rebind_window(
+        &mut self,
+        window: &rio_window::window::Window,
+    ) -> Result<(), String> {
+        use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+
+        let size = window.inner_size();
+        let scale = window.scale_factor() as f32;
+        let sugarloaf_window = SugarloafWindow {
+            handle: window
+                .window_handle()
+                .map_err(|err| format!("window handle unavailable: {err}"))?
+                .into(),
+            display: window
+                .display_handle()
+                .map_err(|err| format!("display handle unavailable: {err}"))?
+                .into(),
+            scale,
+            size: SugarloafWindowSize {
+                width: size.width as f32,
+                height: size.height as f32,
+            },
+        };
+
+        let old_scale = self.sugarloaf.scale_factor();
+        let old_size = self.sugarloaf.window_size();
+        self.sugarloaf.attach_surface(
+            sugarloaf_window,
+            sugarloaf_window_size(size),
+            scale,
+        )?;
+
+        if (old_scale - scale).abs() > f32::EPSILON {
+            self.set_scale(scale, size);
+        } else if old_size.width != size.width as f32
+            || old_size.height != size.height as f32
+        {
+            self.resize(size);
+        }
+
+        // The new surface is blank and the layout may have changed:
+        // repaint every pane in full, not just the visible one.
+        for context_grid in self.context_manager.contexts_mut() {
+            for context in context_grid.contexts_mut().values_mut() {
+                context
+                    .context_mut()
+                    .renderable_content
+                    .pending_update
+                    .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+            }
+        }
+        self.refresh_titles();
+        self.mark_dirty();
+        Ok(())
     }
 
     #[inline]

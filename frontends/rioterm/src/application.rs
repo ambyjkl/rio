@@ -48,6 +48,17 @@ pub struct Application<'a> {
     scheduler: Scheduler,
     app_id: Option<String>,
     global_hotkey: Option<crate::global_hotkey::GlobalHotkeys>,
+    /// The display connection is lost (Wayland compositor exited or
+    /// was replaced) and the event loop is reconnecting. Routes are kept,
+    /// orphaned, until `display_restored` gives them new windows. While
+    /// set, nothing may exit the application just because no window is
+    /// left.
+    display_lost: bool,
+    /// Windows requested while the display was lost, created on restore.
+    pending_new_windows: usize,
+    /// Failed window re-creations so far and when to try again.
+    restore_attempts: u32,
+    restore_retry_at: Option<Instant>,
     /// Frontmost app when the quake window was shown, re-activated
     /// when it hides so focus returns where the user was.
     #[cfg(target_os = "macos")]
@@ -93,6 +104,10 @@ impl Application<'_> {
             scheduler,
             app_id,
             global_hotkey: None,
+            display_lost: false,
+            pending_new_windows: 0,
+            restore_attempts: 0,
+            restore_retry_at: None,
             #[cfg(target_os = "macos")]
             quake_previous_app: None,
         }
@@ -300,7 +315,108 @@ fn title_tracks_size(config: &rio_backend::config::Config) -> bool {
     template.contains("columns") || template.contains("lines")
 }
 
+/// How often and how quickly re-creating the windows after a display
+/// handover is retried before giving up.
+const MAX_RESTORE_ATTEMPTS: u32 = 5;
+const RESTORE_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 impl Application<'_> {
+    /// Exit when the last window is gone, unless that is only because the
+    /// display connection is lost (the routes are then still around).
+    fn exit_if_no_routes(&self, event_loop: &ActiveEventLoop) {
+        if self.router.routes.is_empty() && !self.display_lost {
+            event_loop.exit();
+        }
+    }
+
+    /// Create a window for every orphaned route on the current display
+    /// connection. Routes that could not be restored stay orphaned and
+    /// are retried from `about_to_wait`.
+    fn restore_orphaned_routes(&mut self, event_loop: &ActiveEventLoop) {
+        let orphans: Vec<rio_backend::event::WindowId> = self
+            .router
+            .routes
+            .iter()
+            .filter(|(_, route)| route.window.is_orphaned())
+            .map(|(id, _)| *id)
+            .collect();
+        let mut failed = false;
+
+        for old_id in orphans {
+            let Some(route) = self.router.routes.get(&old_id) else {
+                continue;
+            };
+            let is_quake = route.window.is_quake();
+            let was_quake_visible = is_quake && route.window.orphan_was_visible();
+            // Sized from the monitor like a freshly created quake window.
+            let quake_monitor = if is_quake {
+                self.quake_monitor(event_loop, None)
+            } else {
+                None
+            };
+
+            let Some(route) = self.router.routes.get_mut(&old_id) else {
+                continue;
+            };
+            match route.window.restore_window(
+                event_loop,
+                &self.config,
+                quake_monitor.as_ref(),
+            ) {
+                Ok(new_id) => {
+                    self.router.replace_window_id(old_id, new_id);
+                    if let Some(route) = self.router.routes.get_mut(&new_id) {
+                        route.request_redraw();
+                    }
+                    // The restored quake route is a hidden, freshly created
+                    // layer-shell window: show it through the regular quake
+                    // path (anchor, size, keyboard interactivity) if it was
+                    // visible when the display was lost.
+                    if was_quake_visible {
+                        self.show_quake_window(new_id, event_loop, None, None);
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "Could not re-create window after display loss: {err}"
+                    );
+                    failed = true;
+                }
+            }
+        }
+
+        if failed {
+            self.restore_attempts += 1;
+            if self.restore_attempts >= MAX_RESTORE_ATTEMPTS {
+                tracing::error!(
+                    "Giving up re-creating windows after {} attempts, exiting",
+                    self.restore_attempts
+                );
+                self.restore_retry_at = None;
+                event_loop.exit();
+            } else {
+                self.restore_retry_at = Some(Instant::now() + RESTORE_RETRY_DELAY);
+            }
+            return;
+        }
+
+        self.restore_attempts = 0;
+        self.restore_retry_at = None;
+    }
+
+    /// Create the windows requested while the display was lost.
+    fn create_pending_windows(&mut self, event_loop: &ActiveEventLoop) {
+        for _ in 0..std::mem::take(&mut self.pending_new_windows) {
+            self.router.create_window(
+                event_loop,
+                self.event_proxy.clone(),
+                &self.config,
+                None,
+                self.app_id.as_deref(),
+            );
+        }
+    }
+
     /// Register a system-wide hotkey for every `ToggleQuake` binding
     /// in the config, so the quake window opens while Rio is
     /// unfocused. Wayland uses the XDG Desktop Portal GlobalShortcuts
@@ -360,6 +476,10 @@ impl Application<'_> {
         #[allow(unused_variables)] activation_token: Option<String>,
         output_name: Option<&str>,
     ) {
+        if self.display_lost {
+            return;
+        }
+
         #[cfg(target_os = "macos")]
         {
             self.quake_previous_app =
@@ -369,6 +489,9 @@ impl Application<'_> {
         let Some(route) = self.router.routes.get(&id) else {
             return;
         };
+        if route.window.is_orphaned() {
+            return;
+        }
         let window = &route.window.winit_window;
         let wayland = matches!(
             event_loop.display_handle().unwrap().as_raw(),
@@ -479,6 +602,12 @@ impl Application<'_> {
             return;
         }
 
+        // No display to create or map a layer surface on; the quake route
+        // (if any) is restored by `display_restored`.
+        if self.display_lost {
+            return;
+        }
+
         let quake_id = self
             .router
             .quake_window_id
@@ -528,6 +657,57 @@ impl Application<'_> {
 impl ApplicationHandler<EventPayload> for Application<'_> {
     fn resumed(&mut self, _active_event_loop: &ActiveEventLoop) {}
 
+    fn display_lost(&mut self, _event_loop: &ActiveEventLoop) {
+        tracing::warn!(
+            "Display connection lost, keeping {} window(s) alive until it is restored",
+            self.router.routes.len()
+        );
+        self.display_lost = true;
+        self.restore_retry_at = None;
+        self.restore_attempts = 0;
+
+        for route in self.router.routes.values_mut() {
+            route.window.orphan_window();
+        }
+
+        // The clipboard worker is bound to the dead `wl_display`: dropping
+        // it would tear its proxies down against that display. Leak it
+        // (it only idles) and use a placeholder until a new one can be
+        // created on the new connection.
+        let stale = std::mem::replace(&mut self.router.clipboard, Clipboard::new_nop());
+        std::mem::forget(stale);
+    }
+
+    fn display_restored(&mut self, event_loop: &ActiveEventLoop) {
+        tracing::info!("Display connection restored, re-creating windows");
+        self.display_lost = false;
+
+        match event_loop.display_handle() {
+            // SAFETY: Since this takes a pointer to the event loop's display,
+            // the clipboard MUST be dropped before the display goes away,
+            // which is done in `display_lost` (leak) and `exiting` (drop).
+            Ok(display) => {
+                self.router.clipboard = unsafe { Clipboard::new(display.as_raw()) };
+            }
+            Err(err) => tracing::warn!("Clipboard not re-created: {err}"),
+        }
+
+        // Hotkeys grabbed on a restarted X server (XWayland) are gone.
+        if self.global_hotkey.is_some() {
+            self.setup_quake_hotkey();
+        }
+
+        self.restore_attempts = 0;
+        self.restore_orphaned_routes(event_loop);
+        if self.restore_retry_at.is_some() {
+            return;
+        }
+
+        self.create_pending_windows(event_loop);
+        // Every window was closed while the display was gone.
+        self.exit_if_no_routes(event_loop);
+    }
+
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if cause != StartCause::Init
             && cause != StartCause::CreateWindow
@@ -574,6 +754,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             .or_else(|| event_loop.system_theme());
         update_colors_based_on_theme(&mut self.config, theme);
 
+        if self.display_lost {
+            self.pending_new_windows += 1;
+            return;
+        }
+
         self.router.create_window(
             event_loop,
             self.event_proxy.clone(),
@@ -590,7 +775,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: EventPayload) {
-        let window_id = event.window_id;
+        // Terminals and timers still stamp events with the id of a window
+        // that was replaced after a display handover.
+        let window_id = self.router.resolve_window_id(event.window_id);
         match event.payload {
             RioEventType::Rio(RioEvent::Render) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
@@ -952,9 +1139,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         // Unschedule pending events.
                         self.scheduler.unschedule_window(route_id);
 
-                        if self.router.routes.is_empty() {
-                            event_loop.exit();
-                        }
+                        self.exit_if_no_routes(event_loop);
                     } else {
                         route.window.screen.refresh_titles();
                         let size = route.window.screen.context_manager.len();
@@ -1250,6 +1435,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::CreateWindow) => {
+                if self.display_lost {
+                    self.pending_new_windows += 1;
+                    return;
+                }
                 self.router.create_window(
                     event_loop,
                     self.event_proxy.clone(),
@@ -1294,6 +1483,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::CreateConfigEditor) => {
+                if self.display_lost && !self.config.navigation.open_config_with_split {
+                    return;
+                }
                 if self.config.navigation.open_config_with_split {
                     self.router.open_config_split(&self.config);
                 } else {
@@ -1307,8 +1499,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             #[cfg(target_os = "macos")]
             RioEventType::Rio(RioEvent::CloseWindow) => {
                 self.router.routes.remove(&window_id);
-                if self.router.routes.is_empty() && !self.config.confirm_before_quit {
-                    event_loop.exit();
+                if !self.config.confirm_before_quit {
+                    self.exit_if_no_routes(event_loop);
                 }
             }
             #[cfg(target_os = "macos")]
@@ -1481,6 +1673,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             None => return,
         };
 
+        // The window died with the display connection; whatever still
+        // reaches us for it is stale and must not close the route.
+        if route.window.is_orphaned() {
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 // macOS: Cmd+Q quit confirmation is handled by
@@ -1492,9 +1690,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 // the user has already confirmed — just close.
                 if cfg!(any(target_os = "macos", target_os = "windows")) {
                     self.router.routes.remove(&window_id);
-                    if self.router.routes.is_empty() {
-                        event_loop.exit();
-                    }
+                    self.exit_if_no_routes(event_loop);
                     return;
                 }
 
@@ -1505,9 +1701,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     self.router.routes.remove(&window_id);
                 }
 
-                if self.router.routes.is_empty() {
-                    event_loop.exit();
-                }
+                self.exit_if_no_routes(event_loop);
             }
 
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -2668,7 +2862,20 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             event_loop.exit();
             return;
         }
-        let control_flow = match self.scheduler.update() {
+
+        if !self.display_lost
+            && self.restore_retry_at.is_some_and(|at| at <= Instant::now())
+        {
+            self.restore_retry_at = None;
+            self.restore_orphaned_routes(event_loop);
+        }
+
+        let next_timer = self.scheduler.update();
+        let next_wake = match (next_timer, self.restore_retry_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let control_flow = match next_wake {
             Some(instant) => ControlFlow::WaitUntil(instant),
             None => ControlFlow::Wait,
         };
@@ -2676,6 +2883,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     }
 
     fn open_config(&mut self, event_loop: &ActiveEventLoop) {
+        if self.display_lost && !self.config.navigation.open_config_with_split {
+            return;
+        }
         if self.config.navigation.open_config_with_split {
             self.router.open_config_split(&self.config);
         } else {

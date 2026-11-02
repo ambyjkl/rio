@@ -280,6 +280,14 @@ fn current_index_after_tab_removal(current: usize, removed: usize) -> usize {
 }
 
 impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
+    /// Retarget the window id stamped on events of contexts created from
+    /// now on (after the native window was replaced). Contexts that
+    /// already exist keep the id they were created with; the application
+    /// redirects their events with `Router::resolve_window_id`.
+    pub fn set_window_id(&mut self, window_id: WindowId) {
+        self.window_id = window_id;
+    }
+
     #[inline]
     fn create_context(
         cursor_state: (&Cursor, bool),
