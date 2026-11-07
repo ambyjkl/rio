@@ -740,6 +740,17 @@ impl Window {
     }
 
     pub fn request_wayland_system_bell(&self) -> bool {
+        if self.is_lost() {
+            return false;
+        }
+
+        // A hidden window (e.g. the quake terminal) has no buffer and no
+        // layer role, so the compositor has no mapped surface to attach the
+        // bell to and drops it. Report failure so the caller falls back to
+        // the sound-theme bell.
+        if !self.window_state.lock().unwrap().visible {
+            return false;
+        }
         if let Some(bell) = &self.system_bell {
             if bell.ring(self.surface()) {
                 self.event_loop_awakener.ping();
